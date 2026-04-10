@@ -1,2 +1,4 @@
 ibapi==9.81.1.post1
 loguru==0.7.3
+python-dotenv==1.2.2
+holidays==0.94
