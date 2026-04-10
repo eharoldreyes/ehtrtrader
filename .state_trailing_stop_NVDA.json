@@ -1,0 +1,26 @@
+{
+  "symbol": "NVDA",
+  "strategy": "trailing_stop_loss",
+  "start_date": "2026-04-11",
+  "duration_total_hours": 1.0,
+  "accumulated_trading_hours": 0.030555555555555558,
+  "entry_price": 188.53,
+  "stop_price": 169.677,
+  "peak_price": 188.63,
+  "trailing_active": false,
+  "total_shares": 100,
+  "initial_shares": 100,
+  "ladder_done": {
+    "-0.2": false,
+    "-0.3": false
+  },
+  "trade_log": [
+    {
+      "action": "BUY",
+      "shares": 100,
+      "price": 188.53,
+      "order_id": 9,
+      "reason": "Initial entry"
+    }
+  ]
+}
