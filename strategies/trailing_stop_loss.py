@@ -262,6 +262,16 @@ def run(symbol: str, params: dict = None):
             )
             _clear_state(symbol)
             return
+
+        # Re-sync ladder_done keys to current params.
+        # If params changed between runs, add any new keys as False
+        # and drop keys that no longer exist.
+        current_keys = {str(pct) for pct, _ in ladder}
+        state["ladder_done"] = {
+            k: state["ladder_done"].get(k, False)
+            for k in current_keys
+        }
+        logger.debug(f"Ladder keys synced to current params: {list(current_keys)}")
     else:
         state = {
             "symbol":                   symbol,
@@ -415,7 +425,7 @@ def run(symbol: str, params: dict = None):
             # ── Rule 3: Ladder in on dips ─────────────────────────────────
             for drop_pct, add_shares in ladder:
                 key = str(drop_pct)
-                if not state["ladder_done"][key] and change <= drop_pct:
+                if not state["ladder_done"].get(key, False) and change <= drop_pct:
                     order_id = app.next_order_id
                     app.next_order_id += 1
                     app.placeOrder(order_id, contract,
