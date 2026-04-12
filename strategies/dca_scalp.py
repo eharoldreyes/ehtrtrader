@@ -19,12 +19,54 @@ import sys
 import uuid
 import math
 import time
+import json
 import threading
+import urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from loguru import logger
 import main as tws
+
+# ── CoinGecko fallback for crypto prices (bypasses IBKR API version limit) ───
+COINGECKO_IDS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "LTC": "litecoin",
+    "BCH": "bitcoin-cash",
+}
+
+
+PRICE_CACHE_TTL = 15   # seconds — stays within CoinGecko free tier limits
+_price_cache: dict[str, tuple[float, float]] = {}   # symbol -> (price, timestamp)
+
+
+def get_crypto_price(symbol: str) -> float | None:
+    """
+    Fetch current crypto price from CoinGecko public API. No key required.
+    Caches results for PRICE_CACHE_TTL seconds to respect rate limits.
+    """
+    symbol = symbol.upper()
+    cached_price, cached_at = _price_cache.get(symbol, (None, 0))
+    if cached_price and (time.time() - cached_at) < PRICE_CACHE_TTL:
+        return cached_price
+
+    coin_id = COINGECKO_IDS.get(symbol)
+    if not coin_id:
+        return None
+    try:
+        url = (
+            f"https://api.coingecko.com/api/v3/simple/price"
+            f"?ids={coin_id}&vs_currencies=usd"
+        )
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+            price = float(data[coin_id]["usd"])
+            _price_cache[symbol] = (price, time.time())
+            return price
+    except Exception as e:
+        logger.warning(f"CoinGecko price fetch failed: {e}")
+        return cached_price   # return stale cache on error rather than None
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 PARAMS = [
@@ -75,18 +117,25 @@ class StrategyApp(tws.IBKRApp):
 
     def __init__(self):
         super().__init__()
-        self._price_lock  = threading.Lock()   # one price request at a time
-        self._price_event = threading.Event()
-        self._hist_last   = None
-        self.last_price   = None
-        self._req_counter = 300
+        self._price_lock   = threading.Lock()   # one price request at a time
+        self._price_event  = threading.Event()
+        self._hist_last    = None
+        self._tick_prices  = {}   # reqId -> price
+        self._tick_events  = {}   # reqId -> Event
+        self.last_price    = None
+        self._req_counter  = 300
 
     def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
-        if errorCode == 162:
-            logger.warning(f"No historical data for reqId={reqId} — market may be closed.")
+        if errorCode in (162, 10285):
+            logger.warning(f"Price data unavailable for reqId={reqId}: {errorString}")
+            # Unblock any waiting price event
+            if reqId in self._tick_events:
+                self._tick_events[reqId].set()
+            self._price_event.set()
         else:
             super().error(reqId, errorCode, errorString, advancedOrderRejectJson)
 
+    # ── Historical data (stocks) ──────────────────────────────────────────────
     def historicalData(self, reqId, bar):
         if bar.close and bar.close > 0:
             self._hist_last = bar.close
@@ -97,30 +146,48 @@ class StrategyApp(tws.IBKRApp):
             self._hist_last = None
             self._price_event.set()
 
+    # ── Market data snapshot (crypto) ─────────────────────────────────────────
+    def tickPrice(self, reqId, tickType, price, attrib):
+        # tickType 4 = LAST, 2 = ASK, 1 = BID
+        if tickType in (4, 2, 1) and price > 0:
+            self._tick_prices[reqId] = price
+            if reqId in self._tick_events:
+                self._tick_events[reqId].set()
+
+    def tickSnapshotEnd(self, reqId):
+        if reqId in self._tick_events:
+            self._tick_events[reqId].set()
+
     def fetch_price(self, contract, crypto: bool = False) -> float | None:
-        """Thread-safe price fetch via historical data. No subscription needed."""
+        """
+        Fetch current price.
+        - Crypto: uses CoinGecko public API (bypasses IBKR API version limit).
+        - Stocks: uses IBKR historical data (no subscription needed).
+        """
+        if crypto:
+            return get_crypto_price(contract.symbol)
+
+        # Stocks — historical data via IBKR
         with self._price_lock:
             self._req_counter += 1
+            req_id = self._req_counter
             self._price_event.clear()
             self._hist_last = None
-
             self.reqHistoricalData(
-                reqId          = self._req_counter,
+                reqId          = req_id,
                 contract       = contract,
                 endDateTime    = "",
                 durationStr    = "1 D",
                 barSizeSetting = "5 mins",
                 whatToShow     = "TRADES",
-                useRTH         = 0 if crypto else 1,
+                useRTH         = 1,
                 formatDate     = 1,
                 keepUpToDate   = False,
                 chartOptions   = [],
             )
-
             if not self._price_event.wait(timeout=20):
                 logger.warning("Price fetch timed out.")
                 return None
-
             return self.last_price
 
 
@@ -141,16 +208,24 @@ def run(symbol: str, params: dict = None):
     lock          = threading.Lock()
     stop_event    = threading.Event()
 
-    # ── Connect ───────────────────────────────────────────────────────────────
-    app = StrategyApp()
-    logger.info(f"Connecting to TWS at {tws.TWS_HOST}:{tws.TWS_PORT} ...")
-    app.connect(tws.TWS_HOST, tws.TWS_PORT, tws.CLIENT_ID)
-    threading.Thread(target=app.run, daemon=True).start()
+    # ── Connect (auto-retry client IDs like main.connect()) ──────────────────
+    app = None
+    for attempt in range(10):
+        client_id = tws.CLIENT_ID + attempt
+        _app = StrategyApp()
+        logger.info(f"Connecting to TWS at {tws.TWS_HOST}:{tws.TWS_PORT} (clientId={client_id}) ...")
+        _app.connect(tws.TWS_HOST, tws.TWS_PORT, client_id)
+        threading.Thread(target=_app.run, daemon=True).start()
+        if _app._ready.wait(timeout=5):
+            app = _app
+            logger.success(f"Connected to TWS (clientId={client_id}).")
+            break
+        _app.disconnect()
+        logger.warning(f"clientId={client_id} in use, trying {client_id + 1} ...")
 
-    if not app._ready.wait(timeout=10):
-        logger.error("Timed out waiting for TWS.")
+    if app is None:
+        logger.error("Could not connect to TWS after 10 attempts.")
         sys.exit(1)
-    logger.success("Connected to TWS.")
 
     contract = tws.make_contract(symbol)
 

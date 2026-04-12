@@ -293,16 +293,24 @@ def run(symbol: str, params: dict = None):
             f"duration: {tws.format_duration(duration_total_hours)}"
         )
 
-    # ── Connect ───────────────────────────────────────────────────────────────
-    app = StrategyApp()
-    logger.info(f"Connecting to TWS at {tws.TWS_HOST}:{tws.TWS_PORT} …")
-    app.connect(tws.TWS_HOST, tws.TWS_PORT, tws.CLIENT_ID)
-    threading.Thread(target=app.run, daemon=True).start()
+    # ── Connect (auto-retry client IDs) ──────────────────────────────────────
+    app = None
+    for attempt in range(10):
+        client_id = tws.CLIENT_ID + attempt
+        _app = StrategyApp()
+        logger.info(f"Connecting to TWS at {tws.TWS_HOST}:{tws.TWS_PORT} (clientId={client_id}) ...")
+        _app.connect(tws.TWS_HOST, tws.TWS_PORT, client_id)
+        threading.Thread(target=_app.run, daemon=True).start()
+        if _app._ready.wait(timeout=5):
+            app = _app
+            logger.success(f"Connected to TWS (clientId={client_id}).")
+            break
+        _app.disconnect()
+        logger.warning(f"clientId={client_id} in use, trying {client_id + 1} ...")
 
-    if not app._ready.wait(timeout=10):
-        logger.error("Timed out waiting for TWS.")
+    if app is None:
+        logger.error("Could not connect to TWS after 10 attempts.")
         sys.exit(1)
-    logger.success("Connected to TWS.")
 
     contract = tws.make_contract(symbol)
 
