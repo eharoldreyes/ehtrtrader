@@ -348,10 +348,21 @@ def run(symbol: str, params: dict = None):
             # Query open lots directly from IBKR executions (no local list)
             open_lots = app.get_open_lots(symbol)
             if not open_lots:
+                logger.debug(f"[CHECK] No open lots for {symbol}.")
                 continue
 
-            for lot in open_lots:
+            logger.info(
+                f"[CHECK] {symbol} @ ${price:.2f}  "
+                f"open lots: {len(open_lots)}  "
+                f"target: +{sell_target*100:.2f}%"
+            )
+            for i, lot in enumerate(open_lots, 1):
                 pct = (price - lot["buy_price"]) / lot["buy_price"]
+                logger.info(
+                    f"  lot {i}: {lot['shares']:.6g} @ ${lot['buy_price']:.2f}  "
+                    f"now {pct*100:+.2f}%  "
+                    f"{'-> SELL' if pct >= sell_target else '-> holding'}"
+                )
                 if pct >= sell_target:
                     with lock:
                         order_id = app.next_order_id
