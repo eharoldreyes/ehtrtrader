@@ -9,15 +9,16 @@ To add a new strategy:
 
 from strategies import trailing_stop_loss
 from strategies import supply_demand
+from strategies import dca_scalp
 
 # Registry maps strategy name → module
 # Each module must expose:
 #   PARAMS : list[dict]   — parameter schema for the interactive menu
-#                           must include "duration" key
 #   run(symbol, params)   — entry point
 REGISTRY: dict[str, object] = {
     "trailing_stop_loss": trailing_stop_loss,
     "supply_demand":      supply_demand,
+    "dca_scalp":          dca_scalp,
 }
 
 
