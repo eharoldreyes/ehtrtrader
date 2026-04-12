@@ -172,6 +172,45 @@ Intraday strategy that detects supply/demand zones on 1-minute bars and trades z
 
 ---
 
+### `dca_scalp`
+
+Runs two concurrent schedules: one that buys a fixed USD amount on a timer, and one that sells individual lots when they hit a profit target.
+
+```bash
+python main.py -sym BTC  -strat dca_scalp
+python main.py -sym AAPL -strat dca_scalp
+```
+
+**Parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `budget` | $10,000 | Total capital available |
+| `amount` | $100 | USD to spend per buy order |
+| `buy_frequency` | 60s | Seconds between each buy |
+| `sell_frequency` | 5s | Seconds between each profit check |
+| `profit_target_pct` | 2% | Sell a lot when its profit reaches this % |
+
+**Rules:**
+
+- **Schedule 1** (every `buy_frequency` seconds):
+  1. Check if `budget >= amount`, skip if not
+  2. Buy `amount` USD worth of the symbol at market
+  3. Record the lot with a unique ID (shares, buy price, cost)
+  4. Deduct cost from budget
+
+- **Schedule 2** (every `sell_frequency` seconds):
+  1. Fetch the current price
+  2. For each lot where `(current_price - buy_price) / buy_price >= profit_target_pct`, sell it at market
+  3. Add the sale proceeds back to budget
+
+**Notes:**
+- Each lot is tracked independently — a single buy can be sold individually when profitable
+- Works for both stocks and crypto (crypto uses `cashQty` for buys, `IOC` TIF)
+- Prints a final summary of remaining budget and any unsold positions on exit (Ctrl+C)
+
+---
+
 ## Duration Format
 
 Both strategies accept duration in flexible format:
@@ -221,7 +260,8 @@ ehtrtrader/
 ├── strategies/
 │   ├── __init__.py                       # Strategy registry
 │   ├── trailing_stop_loss.py             # Trailing stop + ladder-in strategy
-│   └── supply_demand.py                  # Supply & demand zone strategy
+│   ├── supply_demand.py                  # Supply & demand zone strategy
+│   └── dca_scalp.py                      # Periodic DCA buy + profit-take sell
 ├── .env                                  # Local config (not tracked)
 ├── .state_trailing_stop_<SYMBOL>.json    # Persisted state for trailing stop
 └── trades_sd.csv                         # Trade log for supply_demand
