@@ -291,6 +291,8 @@ def get_trades(app: IBKRApp, symbol: str = None):
     print(sep)
     print(f"  {len(app.executions)} execution(s)\n")
 
+    summarize_trades(app.executions)
+
 
 def summarize_trades(executions: list):
     """Print a P&L summary grouped by symbol."""
