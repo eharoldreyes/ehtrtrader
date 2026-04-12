@@ -254,9 +254,11 @@ def sell(app: IBKRApp, symbol: str, quantity: float, use_cash_qty: bool = False)
 
 
 # ── Trade history ────────────────────────────────────────────────────────────
-def get_trades(app: IBKRApp):
-    """Fetch and print today's execution history from TWS."""
+def get_trades(app: IBKRApp, symbol: str = None):
+    """Fetch and print today's execution history from TWS. Optionally filter by symbol."""
     f = ExecutionFilter()
+    if symbol:
+        f.symbol = symbol.upper()
     app.reqExecutions(1, f)
 
     if not app._exec_done.wait(timeout=10):
@@ -264,7 +266,8 @@ def get_trades(app: IBKRApp):
         return
 
     if not app.executions:
-        logger.info("No executions found.")
+        label = symbol.upper() if symbol else "any symbol"
+        logger.info(f"No executions found for {label}.")
         return
 
     col = "{:<12} {:<6} {:<10} {:<12} {:<12} {:<20}"
@@ -287,6 +290,46 @@ def get_trades(app: IBKRApp):
 
     print(sep)
     print(f"  {len(app.executions)} execution(s)\n")
+
+
+def summarize_trades(executions: list):
+    """Print a P&L summary grouped by symbol."""
+    totals = {}  # symbol -> {bought_qty, bought_val, sold_qty, sold_val}
+
+    for contract, ex in executions:
+        sym = contract.symbol
+        if sym not in totals:
+            totals[sym] = {"bought_qty": 0.0, "bought_val": 0.0,
+                           "sold_qty":   0.0, "sold_val":   0.0}
+        value = ex.shares * ex.price
+        if ex.side == "BOT":
+            totals[sym]["bought_qty"] += ex.shares
+            totals[sym]["bought_val"] += value
+        else:
+            totals[sym]["sold_qty"]  += ex.shares
+            totals[sym]["sold_val"]  += value
+
+    col = "{:<12} {:<12} {:<14} {:<12} {:<14} {:<12} {:<12}"
+    header = col.format("Symbol", "Bot Qty", "Bot Value", "Sld Qty", "Sld Value", "Net Qty", "Realized P&L")
+    sep = "-" * len(header)
+    print(sep)
+    print(header)
+    print(sep)
+
+    for sym, t in totals.items():
+        net_qty  = t["bought_qty"] - t["sold_qty"]
+        realized = t["sold_val"] - t["bought_val"]  # positive = profit
+        print(col.format(
+            sym,
+            f"{t['bought_qty']:.6g}",
+            f"${t['bought_val']:,.2f}",
+            f"{t['sold_qty']:.6g}",
+            f"${t['sold_val']:,.2f}",
+            f"{net_qty:.6g}",
+            f"${realized:,.2f}",
+        ))
+
+    print(sep + "\n")
 
 
 # ── Strategy parameter menu ───────────────────────────────────────────────────
@@ -429,7 +472,7 @@ if __name__ == "__main__":
     # ── Route: trade history ─────────────────────────────────────────────────
     if args.command == "trades":
         app = connect()
-        get_trades(app)
+        get_trades(app, symbol=args.cmd_sym)
         app.disconnect()
         sys.exit(0)
 
