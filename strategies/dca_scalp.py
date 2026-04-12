@@ -101,11 +101,12 @@ PARAMS = [
         "hint":    "seconds between each profit check",
     },
     {
-        "key":     "profit_target_pct",
-        "label":   "Profit target to trigger sell",
+        "key":     "sell_pct",
+        "label":   "Sell when price increases by",
         "default": 2.0,
         "type":    float,
         "unit":    "%",
+        "hint":    "sell a lot when its price rises this % above its buy price",
     },
 ]
 
@@ -200,7 +201,7 @@ def run(symbol: str, params: dict = None):
     amount           = p["amount"]
     buy_frequency    = int(p["buy_frequency"])
     sell_frequency   = int(p["sell_frequency"])
-    profit_target    = p["profit_target_pct"] / 100
+    profit_target    = p["sell_pct"] / 100
     symbol           = symbol.upper()
     crypto           = tws.is_crypto(symbol)
 
@@ -345,7 +346,7 @@ def run(symbol: str, params: dict = None):
     logger.info(f"  Amount / buy   : ${amount:.2f}")
     logger.info(f"  Buy every      : {buy_frequency}s")
     logger.info(f"  Sell check     : {sell_frequency}s")
-    logger.info(f"  Profit target  : {profit_target * 100:.1f}%")
+    logger.info(f"  Sell when up   : {profit_target * 100:.1f}%")
     logger.info(sep)
 
     buy_thread  = threading.Thread(target=buy_loop,  daemon=True, name="buy-loop")
