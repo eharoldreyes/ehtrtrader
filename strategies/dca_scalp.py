@@ -3,12 +3,11 @@ strategies/dca_scalp.py  -  Periodic DCA buy + profit-take sell strategy.
 
 Schedule 1 (every buy_frequency seconds):
   - Buy `amount` USD worth of the symbol if budget allows.
-  - Record the purchase (id, shares, buy_price, cost) in the purchase list.
   - Deduct cost from budget.
 
 Schedule 2 (every sell_frequency seconds):
-  - Check each item in the purchase list.
-  - If an item is profitable >= profit_target_pct, sell it and return proceeds to budget.
+  - Query open lots from IBKR executions API (FIFO-matched buys vs sells).
+  - Sell any lot whose current price is >= buy_price * (1 + sell_pct).
 
 Invoked by:
   python main.py -sym BTC  -strat dca_scalp
@@ -16,15 +15,14 @@ Invoked by:
 """
 
 import sys
-import uuid
 import math
 import time
 import json
 import threading
 import urllib.request
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from ibapi.execution import ExecutionFilter
 from loguru import logger
 import main as tws
 
@@ -35,7 +33,6 @@ COINGECKO_IDS = {
     "LTC": "litecoin",
     "BCH": "bitcoin-cash",
 }
-
 
 PRICE_CACHE_TTL = 15   # seconds — stays within CoinGecko free tier limits
 _price_cache: dict[str, tuple[float, float]] = {}   # symbol -> (price, timestamp)
@@ -67,6 +64,7 @@ def get_crypto_price(symbol: str) -> float | None:
     except Exception as e:
         logger.warning(f"CoinGecko price fetch failed: {e}")
         return cached_price   # return stale cache on error rather than None
+
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 PARAMS = [
@@ -111,32 +109,34 @@ PARAMS = [
 ]
 
 ET = ZoneInfo("America/New_York")
+EXEC_REQ_ID = 50   # fixed reqId for all reqExecutions calls
 
 
-# ── Extended app with serialized price fetching ───────────────────────────────
+# ── Extended app ──────────────────────────────────────────────────────────────
 class StrategyApp(tws.IBKRApp):
 
     def __init__(self):
         super().__init__()
-        self._price_lock   = threading.Lock()   # one price request at a time
-        self._price_event  = threading.Event()
-        self._hist_last    = None
-        self._tick_prices  = {}   # reqId -> price
-        self._tick_events  = {}   # reqId -> Event
-        self.last_price    = None
-        self._req_counter  = 300
+        # Price fetching
+        self._price_lock  = threading.Lock()
+        self._price_event = threading.Event()
+        self._hist_last   = None
+        self.last_price   = None
+        self._req_counter = 300
+
+        # Execution querying
+        self._exec_lock    = threading.Lock()
+        self._exec_event   = threading.Event()
+        self._exec_results = []   # (contract, execution) from current reqExecutions call
 
     def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
         if errorCode in (162, 10285):
             logger.warning(f"Price data unavailable for reqId={reqId}: {errorString}")
-            # Unblock any waiting price event
-            if reqId in self._tick_events:
-                self._tick_events[reqId].set()
             self._price_event.set()
         else:
             super().error(reqId, errorCode, errorString, advancedOrderRejectJson)
 
-    # ── Historical data (stocks) ──────────────────────────────────────────────
+    # ── Historical data callbacks (stocks price) ──────────────────────────────
     def historicalData(self, reqId, bar):
         if bar.close and bar.close > 0:
             self._hist_last = bar.close
@@ -147,28 +147,25 @@ class StrategyApp(tws.IBKRApp):
             self._hist_last = None
             self._price_event.set()
 
-    # ── Market data snapshot (crypto) ─────────────────────────────────────────
-    def tickPrice(self, reqId, tickType, price, attrib):
-        # tickType 4 = LAST, 2 = ASK, 1 = BID
-        if tickType in (4, 2, 1) and price > 0:
-            self._tick_prices[reqId] = price
-            if reqId in self._tick_events:
-                self._tick_events[reqId].set()
+    # ── Execution callbacks ───────────────────────────────────────────────────
+    def execDetails(self, reqId, contract, execution):
+        if reqId == EXEC_REQ_ID:
+            self._exec_results.append((contract, execution))
 
-    def tickSnapshotEnd(self, reqId):
-        if reqId in self._tick_events:
-            self._tick_events[reqId].set()
+    def execDetailsEnd(self, reqId):
+        if reqId == EXEC_REQ_ID:
+            self._exec_event.set()
 
+    # ── Price fetch ───────────────────────────────────────────────────────────
     def fetch_price(self, contract, crypto: bool = False) -> float | None:
         """
         Fetch current price.
-        - Crypto: uses CoinGecko public API (bypasses IBKR API version limit).
-        - Stocks: uses IBKR historical data (no subscription needed).
+        - Crypto: CoinGecko public API (bypasses IBKR API version limit).
+        - Stocks: IBKR historical data (no subscription needed).
         """
         if crypto:
             return get_crypto_price(contract.symbol)
 
-        # Stocks — historical data via IBKR
         with self._price_lock:
             self._req_counter += 1
             req_id = self._req_counter
@@ -191,25 +188,76 @@ class StrategyApp(tws.IBKRApp):
                 return None
             return self.last_price
 
+    # ── Open lots via IBKR executions API ────────────────────────────────────
+    def get_open_lots(self, symbol: str) -> list:
+        """
+        Query IBKR for all executions of `symbol`, then FIFO-match
+        buys against sells to return only the unmatched (open) buy lots.
+
+        Returns: list of {shares, buy_price}
+        """
+        with self._exec_lock:
+            self._exec_results.clear()
+            self._exec_event.clear()
+
+            f = ExecutionFilter()
+            f.symbol = symbol.upper()
+            self.reqExecutions(EXEC_REQ_ID, f)
+
+            if not self._exec_event.wait(timeout=10):
+                logger.warning("Timed out waiting for execution data.")
+                return []
+
+            executions = list(self._exec_results)
+
+        # Sort buys and sells chronologically
+        buys  = sorted(
+            [(e.shares, e.price, e.time) for _, e in executions if e.side == "BOT"],
+            key=lambda x: x[2],
+        )
+        sells = sorted(
+            [(e.shares, e.price, e.time) for _, e in executions if e.side == "SLD"],
+            key=lambda x: x[2],
+        )
+
+        # FIFO match: pair sell qty against the earliest unmatched buy
+        sell_queue = list(sells)
+        open_lots  = []
+
+        for shares, price, timestamp in buys:
+            remaining = shares
+            while sell_queue and remaining > 1e-8:
+                s_shares = sell_queue[0][0]
+                matched  = min(remaining, s_shares)
+                remaining -= matched
+                if s_shares - matched > 1e-8:
+                    sell_queue[0] = (s_shares - matched, sell_queue[0][1], sell_queue[0][2])
+                else:
+                    sell_queue.pop(0)
+
+            if remaining > 1e-8:
+                open_lots.append({"shares": remaining, "buy_price": price})
+
+        return open_lots
+
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 def run(symbol: str, params: dict = None):
     defaults = {p["key"]: p["default"] for p in PARAMS}
     p = {**defaults, **(params or {})}
 
-    budget           = p["budget"]
-    amount           = p["amount"]
-    buy_frequency    = int(p["buy_frequency"])
-    sell_frequency   = int(p["sell_frequency"])
-    profit_target    = p["sell_pct"] / 100
-    symbol           = symbol.upper()
-    crypto           = tws.is_crypto(symbol)
+    budget        = p["budget"]
+    amount        = p["amount"]
+    buy_frequency = int(p["buy_frequency"])
+    sell_frequency = int(p["sell_frequency"])
+    sell_target   = p["sell_pct"] / 100
+    symbol        = symbol.upper()
+    crypto        = tws.is_crypto(symbol)
 
-    purchase_list = []    # [{id, shares, buy_price, cost, order_id}]
-    lock          = threading.Lock()
-    stop_event    = threading.Event()
+    lock       = threading.Lock()
+    stop_event = threading.Event()
 
-    # ── Connect (auto-retry client IDs like main.connect()) ──────────────────
+    # ── Connect (auto-retry client IDs) ──────────────────────────────────────
     app = None
     for attempt in range(10):
         client_id = tws.CLIENT_ID + attempt
@@ -253,7 +301,6 @@ def run(symbol: str, params: dict = None):
                 continue
 
             with lock:
-                # Re-check budget inside lock in case sell updated it
                 if budget < amount:
                     stop_event.wait(buy_frequency)
                     continue
@@ -263,7 +310,7 @@ def run(symbol: str, params: dict = None):
 
                 if crypto:
                     order  = tws.make_order("BUY", amount, use_cash_qty=True, crypto=True)
-                    shares = amount / price          # estimated from cashQty
+                    shares = amount / price
                     cost   = amount
                 else:
                     shares = math.floor(amount / price)
@@ -278,21 +325,11 @@ def run(symbol: str, params: dict = None):
                     cost  = shares * price
 
                 app.placeOrder(order_id, contract, order)
-
-                item = {
-                    "id":        str(uuid.uuid4())[:8],
-                    "shares":    shares,
-                    "buy_price": price,
-                    "cost":      cost,
-                    "order_id":  order_id,
-                }
-                purchase_list.append(item)
                 budget -= cost
 
                 logger.info(
-                    f"[BUY  #{item['id']}]  {shares:.6g} {symbol} "
-                    f"@ ${price:.2f}  cost=${cost:.2f}  "
-                    f"budget=${budget:.2f}  positions={len(purchase_list)}"
+                    f"[BUY]  {shares:.6g} {symbol} @ ${price:.2f}  "
+                    f"cost=${cost:.2f}  budget=${budget:.2f}"
                 )
 
             stop_event.wait(buy_frequency)
@@ -304,37 +341,36 @@ def run(symbol: str, params: dict = None):
         while not stop_event.is_set():
             stop_event.wait(sell_frequency)
 
-            with lock:
-                if not purchase_list:
-                    continue
-
             price = app.fetch_price(contract, crypto=crypto)
             if not price:
                 continue
 
-            with lock:
-                to_sell = [
-                    item for item in purchase_list
-                    if (price - item["buy_price"]) / item["buy_price"] >= profit_target
-                ]
+            # Query open lots directly from IBKR executions (no local list)
+            open_lots = app.get_open_lots(symbol)
+            if not open_lots:
+                continue
 
-                for item in to_sell:
-                    order_id = app.next_order_id
-                    app.next_order_id += 1
+            for lot in open_lots:
+                pct = (price - lot["buy_price"]) / lot["buy_price"]
+                if pct >= sell_target:
+                    with lock:
+                        order_id = app.next_order_id
+                        app.next_order_id += 1
 
-                    order = tws.make_order("SELL", item["shares"], crypto=crypto)
+                    order = tws.make_order("SELL", lot["shares"], crypto=crypto)
                     app.placeOrder(order_id, contract, order)
 
-                    sell_value  = item["shares"] * price
-                    profit      = sell_value - item["cost"]
-                    profit_pct  = profit / item["cost"] * 100
-                    budget     += sell_value
-                    purchase_list.remove(item)
+                    sell_value = lot["shares"] * price
+                    profit     = sell_value - (lot["shares"] * lot["buy_price"])
+
+                    with lock:
+                        budget += sell_value
 
                     logger.info(
-                        f"[SELL #{item['id']}]  {item['shares']:.6g} {symbol} "
-                        f"@ ${price:.2f}  profit=${profit:.2f} (+{profit_pct:.2f}%)  "
-                        f"budget=${budget:.2f}  positions={len(purchase_list)}"
+                        f"[SELL] {lot['shares']:.6g} {symbol} @ ${price:.2f}  "
+                        f"bought @ ${lot['buy_price']:.2f}  "
+                        f"profit=${profit:.2f} (+{pct*100:.2f}%)  "
+                        f"budget=${budget:.2f}"
                     )
 
     # ── Launch ────────────────────────────────────────────────────────────────
@@ -346,7 +382,7 @@ def run(symbol: str, params: dict = None):
     logger.info(f"  Amount / buy   : ${amount:.2f}")
     logger.info(f"  Buy every      : {buy_frequency}s")
     logger.info(f"  Sell check     : {sell_frequency}s")
-    logger.info(f"  Sell when up   : {profit_target * 100:.1f}%")
+    logger.info(f"  Sell when up   : {sell_target * 100:.1f}%")
     logger.info(sep)
 
     buy_thread  = threading.Thread(target=buy_loop,  daemon=True, name="buy-loop")
@@ -364,22 +400,23 @@ def run(symbol: str, params: dict = None):
     buy_thread.join(timeout=5)
     sell_thread.join(timeout=5)
 
-    # ── Final summary ─────────────────────────────────────────────────────────
-    with lock:
-        logger.info(sep)
-        logger.info("  FINAL SUMMARY")
-        logger.info(sep)
-        logger.info(f"  Remaining budget  : ${budget:.2f}")
-        logger.info(f"  Open positions    : {len(purchase_list)}")
-        for item in purchase_list:
-            unrealized = (item["shares"] * (app.last_price or item["buy_price"])) - item["cost"]
-            logger.info(
-                f"    #{item['id']}  {item['shares']:.6g} {symbol} "
-                f"@ ${item['buy_price']:.2f}  "
-                f"cost=${item['cost']:.2f}  "
-                f"unrealized=${unrealized:.2f}"
-            )
-        logger.info(sep)
+    # ── Final summary (open lots from IBKR) ──────────────────────────────────
+    open_lots   = app.get_open_lots(symbol)
+    last_price  = app.fetch_price(contract, crypto=crypto)
+
+    logger.info(sep)
+    logger.info("  FINAL SUMMARY")
+    logger.info(sep)
+    logger.info(f"  Remaining budget  : ${budget:.2f}")
+    logger.info(f"  Open positions    : {len(open_lots)}")
+    for lot in open_lots:
+        cur    = last_price or lot["buy_price"]
+        unreal = (cur - lot["buy_price"]) * lot["shares"]
+        logger.info(
+            f"    {lot['shares']:.6g} {symbol} @ ${lot['buy_price']:.2f}  "
+            f"unrealized=${unreal:.2f}"
+        )
+    logger.info(sep)
 
     app.disconnect()
     logger.info("Strategy session ended.")
