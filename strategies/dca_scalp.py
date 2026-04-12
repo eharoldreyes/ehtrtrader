@@ -155,6 +155,10 @@ class StrategyApp(tws.IBKRApp):
         if errorCode in (162, 10285):
             logger.warning(f"Price data unavailable for reqId={reqId}: {errorString}")
             self._price_event.set()
+        elif errorCode == 320 and reqId == EXEC_REQ_ID:
+            # TWS can't parse fractional crypto execution sizes — unblock caller
+            logger.debug(f"Execution query failed (code 320) — fractional size not supported by this TWS version.")
+            self._exec_event.set()
         else:
             super().error(reqId, errorCode, errorString, advancedOrderRejectJson)
 
@@ -276,6 +280,10 @@ def run(symbol: str, params: dict = None):
     symbol        = symbol.upper()
     crypto        = tws.is_crypto(symbol)
 
+    # Crypto: IBKR can't parse fractional execution sizes (TWS < v163),
+    # so we track open lots locally. Stocks use the IBKR executions API.
+    local_lots = [] if crypto else None   # [{shares, buy_price, cost}]
+
     lock       = threading.Lock()
     stop_event = threading.Event()
 
@@ -349,6 +357,9 @@ def run(symbol: str, params: dict = None):
                 app.placeOrder(order_id, contract, order)
                 budget -= cost
 
+                if local_lots is not None:
+                    local_lots.append({"shares": shares, "buy_price": price, "cost": cost})
+
                 logger.info(
                     f"[BUY]  {shares:.6g} {symbol} @ ${price:.2f}  "
                     f"cost=${cost:.2f}  budget=${budget:.2f}"
@@ -367,8 +378,11 @@ def run(symbol: str, params: dict = None):
             if not price:
                 continue
 
-            # Query open lots directly from IBKR executions (no local list)
-            open_lots = app.get_open_lots(symbol)
+            # Crypto: use local lots (IBKR can't parse fractional execution sizes)
+            # Stocks: query IBKR executions API for source of truth
+            with lock:
+                open_lots = list(local_lots) if local_lots is not None else app.get_open_lots(symbol)
+
             if not open_lots:
                 logger.debug(f"[CHECK] No open lots for {symbol}.")
                 continue
@@ -398,6 +412,8 @@ def run(symbol: str, params: dict = None):
 
                     with lock:
                         budget += sell_value
+                        if local_lots is not None and lot in local_lots:
+                            local_lots.remove(lot)
 
                     logger.info(
                         f"[SELL] {lot['shares']:.6g} {symbol} @ ${price:.2f}  "
@@ -433,9 +449,9 @@ def run(symbol: str, params: dict = None):
     buy_thread.join(timeout=5)
     sell_thread.join(timeout=5)
 
-    # ── Final summary (open lots from IBKR) ──────────────────────────────────
-    open_lots   = app.get_open_lots(symbol)
-    last_price  = app.fetch_price(contract, crypto=crypto)
+    # ── Final summary ─────────────────────────────────────────────────────────
+    open_lots  = local_lots if local_lots is not None else app.get_open_lots(symbol)
+    last_price = app.fetch_price(contract, crypto=crypto)
 
     logger.info(sep)
     logger.info("  FINAL SUMMARY")
