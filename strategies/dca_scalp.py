@@ -27,6 +27,15 @@ from loguru import logger
 import main as tws
 
 # ── CoinGecko fallback for crypto prices (bypasses IBKR API version limit) ───
+# Binance symbol map (primary — no auth, 1200 req/min)
+BINANCE_SYMBOLS = {
+    "BTC": "BTCUSDT",
+    "ETH": "ETHUSDT",
+    "LTC": "LTCUSDT",
+    "BCH": "BCHUSDT",
+}
+
+# CoinGecko symbol map (fallback)
 COINGECKO_IDS = {
     "BTC": "bitcoin",
     "ETH": "ethereum",
@@ -34,36 +43,49 @@ COINGECKO_IDS = {
     "BCH": "bitcoin-cash",
 }
 
-PRICE_CACHE_TTL = 15   # seconds — stays within CoinGecko free tier limits
+PRICE_CACHE_TTL = 10   # seconds
 _price_cache: dict[str, tuple[float, float]] = {}   # symbol -> (price, timestamp)
+
+
+def _fetch_binance(symbol: str) -> float | None:
+    pair = BINANCE_SYMBOLS.get(symbol)
+    if not pair:
+        return None
+    url = f"https://api.binance.com/api/v3/ticker/price?symbol={pair}"
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        return float(json.loads(resp.read())["price"])
+
+
+def _fetch_coingecko(symbol: str) -> float | None:
+    coin_id = COINGECKO_IDS.get(symbol)
+    if not coin_id:
+        return None
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        return float(json.loads(resp.read())[coin_id]["usd"])
 
 
 def get_crypto_price(symbol: str) -> float | None:
     """
-    Fetch current crypto price from CoinGecko public API. No key required.
-    Caches results for PRICE_CACHE_TTL seconds to respect rate limits.
+    Fetch crypto price. Uses Binance first (generous rate limits),
+    falls back to CoinGecko. Results cached for PRICE_CACHE_TTL seconds.
     """
     symbol = symbol.upper()
     cached_price, cached_at = _price_cache.get(symbol, (None, 0))
     if cached_price and (time.time() - cached_at) < PRICE_CACHE_TTL:
         return cached_price
 
-    coin_id = COINGECKO_IDS.get(symbol)
-    if not coin_id:
-        return None
-    try:
-        url = (
-            f"https://api.coingecko.com/api/v3/simple/price"
-            f"?ids={coin_id}&vs_currencies=usd"
-        )
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            data = json.loads(resp.read())
-            price = float(data[coin_id]["usd"])
-            _price_cache[symbol] = (price, time.time())
-            return price
-    except Exception as e:
-        logger.warning(f"CoinGecko price fetch failed: {e}")
-        return cached_price   # return stale cache on error rather than None
+    for name, fetcher in [("Binance", _fetch_binance), ("CoinGecko", _fetch_coingecko)]:
+        try:
+            price = fetcher(symbol)
+            if price:
+                _price_cache[symbol] = (price, time.time())
+                return price
+        except Exception as e:
+            logger.warning(f"{name} price fetch failed: {e} -- trying next source.")
+
+    logger.error(f"All price sources failed for {symbol}. Using stale cache.")
+    return cached_price
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
