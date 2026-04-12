@@ -131,7 +131,8 @@ PARAMS = [
 ]
 
 ET = ZoneInfo("America/New_York")
-EXEC_REQ_ID = 50   # fixed reqId for all reqExecutions calls
+EXEC_REQ_ID  = 50      # fixed reqId for all reqExecutions calls
+MIN_LOT_SIZE = 0.0001  # filter IOC order remnants (e.g. 1.4e-05 BTC partial fills)
 
 
 # ── Extended app ──────────────────────────────────────────────────────────────
@@ -155,10 +156,11 @@ class StrategyApp(tws.IBKRApp):
         if errorCode in (162, 10285):
             logger.warning(f"Price data unavailable for reqId={reqId}: {errorString}")
             self._price_event.set()
-        elif errorCode == 320 and reqId == EXEC_REQ_ID:
-            # TWS can't parse fractional crypto execution sizes — unblock caller
-            logger.debug(f"Execution query failed (code 320) — fractional size not supported by this TWS version.")
-            self._exec_event.set()
+        elif errorCode == 320:
+            # TWS can't parse a tiny fractional lot size (IOC order remnant, e.g. 1.4e-05 BTC).
+            # The real lots still arrive via execDetails; execDetailsEnd will still fire.
+            # Do NOT unblock _exec_event here -- let execDetailsEnd handle it normally.
+            logger.debug(f"Skipping unparseable execution record (code 320): {errorString}")
         else:
             super().error(reqId, errorCode, errorString, advancedOrderRejectJson)
 
@@ -264,6 +266,11 @@ class StrategyApp(tws.IBKRApp):
             if remaining > 1e-8:
                 open_lots.append({"shares": remaining, "buy_price": price})
 
+        # Drop IOC remnant lots that are too small to be real positions.
+        # These are caused by IBKR's fractional-fill parse error (code 320)
+        # and show up as tiny leftovers like 1.4e-05 BTC.
+        open_lots = [lot for lot in open_lots if lot["shares"] >= MIN_LOT_SIZE]
+
         return open_lots
 
 
@@ -279,10 +286,6 @@ def run(symbol: str, params: dict = None):
     sell_target   = p["sell_pct"] / 100
     symbol        = symbol.upper()
     crypto        = tws.is_crypto(symbol)
-
-    # Crypto: IBKR can't parse fractional execution sizes (TWS < v163),
-    # so we track open lots locally. Stocks use the IBKR executions API.
-    local_lots = [] if crypto else None   # [{shares, buy_price, cost}]
 
     lock       = threading.Lock()
     stop_event = threading.Event()
@@ -357,9 +360,6 @@ def run(symbol: str, params: dict = None):
                 app.placeOrder(order_id, contract, order)
                 budget -= cost
 
-                if local_lots is not None:
-                    local_lots.append({"shares": shares, "buy_price": price, "cost": cost})
-
                 logger.info(
                     f"[BUY]  {shares:.6g} {symbol} @ ${price:.2f}  "
                     f"cost=${cost:.2f}  budget=${budget:.2f}"
@@ -378,10 +378,8 @@ def run(symbol: str, params: dict = None):
             if not price:
                 continue
 
-            # Crypto: use local lots (IBKR can't parse fractional execution sizes)
-            # Stocks: query IBKR executions API for source of truth
             with lock:
-                open_lots = list(local_lots) if local_lots is not None else app.get_open_lots(symbol)
+                open_lots = app.get_open_lots(symbol)
 
             if not open_lots:
                 logger.debug(f"[CHECK] No open lots for {symbol}.")
@@ -412,8 +410,6 @@ def run(symbol: str, params: dict = None):
 
                     with lock:
                         budget += sell_value
-                        if local_lots is not None and lot in local_lots:
-                            local_lots.remove(lot)
 
                     logger.info(
                         f"[SELL] {lot['shares']:.6g} {symbol} @ ${price:.2f}  "
@@ -450,7 +446,7 @@ def run(symbol: str, params: dict = None):
     sell_thread.join(timeout=5)
 
     # ── Final summary ─────────────────────────────────────────────────────────
-    open_lots  = local_lots if local_lots is not None else app.get_open_lots(symbol)
+    open_lots  = app.get_open_lots(symbol)
     last_price = app.fetch_price(contract, crypto=crypto)
 
     logger.info(sep)
