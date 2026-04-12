@@ -169,35 +169,51 @@ def connect() -> IBKRApp:
 
 
 # ── Contract / Order helpers ──────────────────────────────────────────────────
+CRYPTO_SYMBOLS = {"BTC", "ETH", "LTC", "BCH"}
+
+
+def is_crypto(symbol: str) -> bool:
+    return symbol.upper() in CRYPTO_SYMBOLS
+
+
 def make_contract(symbol: str) -> Contract:
     c = Contract()
     c.symbol   = symbol
-    c.secType  = "STK"
-    c.exchange = "SMART"
+    if is_crypto(symbol):
+        c.secType  = "CRYPTO"
+        c.exchange = "PAXOS"
+    else:
+        c.secType  = "STK"
+        c.exchange = "SMART"
     c.currency = "USD"
     return c
 
 
-def make_order(action: str, quantity: int) -> Order:
+def make_order(action: str, quantity: float, use_cash_qty: bool = False, crypto: bool = False) -> Order:
     o = Order()
     o.action        = action        # "BUY" or "SELL"
-    o.totalQuantity = quantity
     o.orderType     = "MKT"
-    o.tif           = "DAY"
+    o.tif           = "IOC" if crypto else "DAY"
     o.eTradeOnly    = False
     o.firmQuoteOnly = False
+    if use_cash_qty:
+        o.cashQty = float(quantity)
+    else:
+        o.totalQuantity = float(quantity)
     return o
 
 
 # ── Core order functions ──────────────────────────────────────────────────────
-def buy(app: IBKRApp, symbol: str, quantity: int):
-    """Place a market BUY order."""
+def buy(app: IBKRApp, symbol: str, quantity: float, use_cash_qty: bool = False):
+    """Place a market BUY order. use_cash_qty=True spends quantity as USD."""
+    crypto   = is_crypto(symbol)
     contract = make_contract(symbol)
-    order    = make_order("BUY", quantity)
+    order    = make_order("BUY", quantity, use_cash_qty=use_cash_qty, crypto=crypto)
     order_id = app.next_order_id
     app.next_order_id += 1
 
-    logger.info(f"Placing BUY: {quantity} × {symbol}  (orderId={order_id})")
+    label = f"${quantity} USD of" if use_cash_qty else f"{quantity} ×"
+    logger.info(f"Placing BUY: {label} {symbol}  (orderId={order_id})")
     app.placeOrder(order_id, contract, order)
 
     time.sleep(5)
@@ -205,14 +221,16 @@ def buy(app: IBKRApp, symbol: str, quantity: int):
     logger.info(f"Final status: {status}")
 
 
-def sell(app: IBKRApp, symbol: str, quantity: int):
-    """Place a market SELL order."""
+def sell(app: IBKRApp, symbol: str, quantity: float, use_cash_qty: bool = False):
+    """Place a market SELL order. use_cash_qty=True sells quantity as USD worth."""
+    crypto   = is_crypto(symbol)
     contract = make_contract(symbol)
-    order    = make_order("SELL", quantity)
+    order    = make_order("SELL", quantity, use_cash_qty=use_cash_qty, crypto=crypto)
     order_id = app.next_order_id
     app.next_order_id += 1
 
-    logger.info(f"Placing SELL: {quantity} × {symbol}  (orderId={order_id})")
+    label = f"${quantity} USD of" if use_cash_qty else f"{quantity} ×"
+    logger.info(f"Placing SELL: {label} {symbol}  (orderId={order_id})")
     app.placeOrder(order_id, contract, order)
 
     time.sleep(5)
@@ -324,7 +342,7 @@ if __name__ == "__main__":
     parser.add_argument("command",  nargs="?",
                         choices=["buy", "sell", "watchlist", "strategies"])
     parser.add_argument("cmd_sym",  nargs="?", type=str, help=argparse.SUPPRESS)
-    parser.add_argument("cmd_qty",  nargs="?", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("cmd_qty",  nargs="?", type=str, help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
@@ -368,17 +386,28 @@ if __name__ == "__main__":
     # ── Route: manual buy / sell ──────────────────────────────────────────────
     if args.command in ("buy", "sell"):
         if not args.cmd_sym or not args.cmd_qty:
-            parser.error(f"{args.command} requires <symbol> <quantity>")
+            parser.error(f"{args.command} requires <symbol> <quantity>  (prefix $ for USD, e.g. $100)")
 
-        if not is_market_open():
+        sym = args.cmd_sym.upper()
+        qty_raw = args.cmd_qty
+
+        use_cash_qty = qty_raw.startswith("$")
+        try:
+            qty = float(qty_raw.lstrip("$"))
+        except ValueError:
+            parser.error(f"Invalid quantity '{qty_raw}'. Use a number like 10 or $100.")
+
+        if is_crypto(sym):
+            logger.info(f"{sym} is a crypto asset — skipping NYSE market hours check.")
+        elif not is_market_open():
             logger.error("Order aborted — market is not open.")
             sys.exit(1)
 
         app = connect()
         if args.command == "buy":
-            buy(app, args.cmd_sym.upper(), args.cmd_qty)
+            buy(app, sym, qty, use_cash_qty=use_cash_qty)
         else:
-            sell(app, args.cmd_sym.upper(), args.cmd_qty)
+            sell(app, sym, qty, use_cash_qty=use_cash_qty)
         app.disconnect()
         logger.info("Done.")
         sys.exit(0)
