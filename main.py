@@ -378,7 +378,10 @@ def prompt_params(strategy_name: str, schema: list) -> dict:
                     results[key] = default
             else:
                 try:
-                    results[key] = p["type"](raw)
+                    # Strip unit suffix (e.g. "%", "$", "s") so "0.20%" parses as 0.20
+                    unit = p.get("unit", "")
+                    clean = raw.rstrip(unit).strip() if unit and raw.endswith(unit) else raw
+                    results[key] = p["type"](clean)
                     changed.append(key)
                 except ValueError:
                     print(f"    [!] Invalid value '{raw}', using default '{display}'.")
