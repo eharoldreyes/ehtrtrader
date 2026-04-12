@@ -23,6 +23,7 @@ from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
 from ibapi.order import Order
+from ibapi.execution import ExecutionFilter
 
 # ── Load .env ─────────────────────────────────────────────────────────────────
 load_dotenv(Path(__file__).parent / ".env")
@@ -121,6 +122,8 @@ class IBKRApp(EWrapper, EClient):
         self.next_order_id  = None
         self._ready         = threading.Event()
         self.order_statuses = {}  # orderId -> status
+        self.executions     = []  # list of (contract, execution) tuples
+        self._exec_done     = threading.Event()
 
     def nextValidId(self, orderId: int):
         super().nextValidId(orderId)
@@ -148,24 +151,36 @@ class IBKRApp(EWrapper, EClient):
             f"{order.action} {order.totalQuantity}"
         )
 
+    def execDetails(self, reqId, contract, execution):
+        self.executions.append((contract, execution))
+
+    def execDetailsEnd(self, reqId):
+        self._exec_done.set()
+
 
 # ── Connection ────────────────────────────────────────────────────────────────
 def connect() -> IBKRApp:
-    """Connect to TWS and return a ready IBKRApp instance."""
-    app = IBKRApp()
+    """Connect to TWS, auto-retrying with incremented client IDs if the slot is in use."""
+    for attempt in range(10):
+        client_id = CLIENT_ID + attempt
+        app = IBKRApp()
 
-    logger.info(f"Connecting to TWS at {TWS_HOST}:{TWS_PORT} …")
-    app.connect(TWS_HOST, TWS_PORT, CLIENT_ID)
+        logger.info(f"Connecting to TWS at {TWS_HOST}:{TWS_PORT} (clientId={client_id}) …")
+        app.connect(TWS_HOST, TWS_PORT, client_id)
 
-    thread = threading.Thread(target=app.run, daemon=True)
-    thread.start()
+        thread = threading.Thread(target=app.run, daemon=True)
+        thread.start()
 
-    if not app._ready.wait(timeout=10):
-        logger.error("Timed out waiting for TWS. Is TWS running with API enabled?")
-        sys.exit(1)
+        if app._ready.wait(timeout=5):
+            logger.success(f"Connected to TWS (clientId={client_id}).")
+            return app
 
-    logger.success("Connected to TWS.")
-    return app
+        # clientId in use (code 326) — disconnect and try the next one
+        app.disconnect()
+        logger.warning(f"clientId={client_id} in use, trying {client_id + 1} …")
+
+    logger.error("Could not connect to TWS after 10 attempts. Is TWS running with API enabled?")
+    sys.exit(1)
 
 
 # ── Contract / Order helpers ──────────────────────────────────────────────────
@@ -236,6 +251,42 @@ def sell(app: IBKRApp, symbol: str, quantity: float, use_cash_qty: bool = False)
     time.sleep(5)
     status = app.order_statuses.get(order_id, "no status received")
     logger.info(f"Final status: {status}")
+
+
+# ── Trade history ────────────────────────────────────────────────────────────
+def get_trades(app: IBKRApp):
+    """Fetch and print today's execution history from TWS."""
+    f = ExecutionFilter()
+    app.reqExecutions(1, f)
+
+    if not app._exec_done.wait(timeout=10):
+        logger.warning("Timed out waiting for execution data.")
+        return
+
+    if not app.executions:
+        logger.info("No executions found.")
+        return
+
+    col = "{:<12} {:<6} {:<10} {:<12} {:<12} {:<20}"
+    header = col.format("Symbol", "Side", "Qty", "Price", "Value", "Time")
+    sep = "-" * len(header)
+    print(f"\n{sep}")
+    print(header)
+    print(sep)
+
+    for contract, ex in app.executions:
+        value = ex.shares * ex.price
+        print(col.format(
+            contract.symbol,
+            ex.side,
+            f"{ex.shares:.6g}",
+            f"${ex.price:,.2f}",
+            f"${value:,.2f}",
+            ex.time,
+        ))
+
+    print(sep)
+    print(f"  {len(app.executions)} execution(s)\n")
 
 
 # ── Strategy parameter menu ───────────────────────────────────────────────────
@@ -340,7 +391,7 @@ if __name__ == "__main__":
 
     # ── Utility sub-commands (optional positional) ────────────────────────────
     parser.add_argument("command",  nargs="?",
-                        choices=["buy", "sell", "watchlist", "strategies"])
+                        choices=["buy", "sell", "watchlist", "strategies", "trades"])
     parser.add_argument("cmd_sym",  nargs="?", type=str, help=argparse.SUPPRESS)
     parser.add_argument("cmd_qty",  nargs="?", type=str, help=argparse.SUPPRESS)
 
@@ -373,6 +424,13 @@ if __name__ == "__main__":
         logger.info(f"Available strategies ({len(names)}):")
         for name in names:
             logger.info(f"  • {name}")
+        sys.exit(0)
+
+    # ── Route: trade history ─────────────────────────────────────────────────
+    if args.command == "trades":
+        app = connect()
+        get_trades(app)
+        app.disconnect()
         sys.exit(0)
 
     # ── Route: watchlist ──────────────────────────────────────────────────────
