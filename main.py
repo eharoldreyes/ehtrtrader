@@ -340,7 +340,7 @@ def prompt_params(strategy_name: str, schema: list) -> dict:
     Interactively ask the user to configure strategy parameters.
     Press Enter on any prompt to keep the default value.
     """
-    sep = "━" * 60
+    sep = "=" * 60
     print(f"\n{sep}")
     print(f"  Strategy : {strategy_name}")
     print(f"  Press Enter to keep the default, or type a new value.")
@@ -361,7 +361,7 @@ def prompt_params(strategy_name: str, schema: list) -> dict:
 
         # Show hint line for complex params (e.g. duration)
         if hint:
-            print(f"  {'':>{col}}   ↳ {hint}")
+            print(f"  {'':>{col}}   >> {hint}")
 
         raw = input(prompt).strip()
 
@@ -370,18 +370,18 @@ def prompt_params(strategy_name: str, schema: list) -> dict:
             if key == "duration":
                 try:
                     total_h = parse_duration(raw)
-                    print(f"    → {format_duration(total_h)}  =  {total_h:.1f} trading hours")
+                    print(f"    -> {format_duration(total_h)}  =  {total_h:.1f} trading hours")
                     results[key] = raw
                     changed.append(key)
                 except ValueError as e:
-                    print(f"    ⚠  {e}  Using default '{default}'.")
+                    print(f"    [!] {e}  Using default '{default}'.")
                     results[key] = default
             else:
                 try:
                     results[key] = p["type"](raw)
                     changed.append(key)
                 except ValueError:
-                    print(f"    ⚠  Invalid value '{raw}', using default '{display}'.")
+                    print(f"    [!] Invalid value '{raw}', using default '{display}'.")
                     results[key] = default
         else:
             results[key] = default
@@ -393,7 +393,7 @@ def prompt_params(strategy_name: str, schema: list) -> dict:
         key   = p["key"]
         val   = results[key]
         unit  = p.get("unit", "")
-        tag   = "  ← changed" if key in changed else ""
+        tag   = "  <- changed" if key in changed else ""
 
         # For duration, also show parsed hours
         if key == "duration":
@@ -447,7 +447,9 @@ if __name__ == "__main__":
         if not args.sym:
             parser.error("Strategy mode requires: -sym")
 
-        if not is_market_open():
+        if is_crypto(args.sym.upper()):
+            logger.info(f"{args.sym.upper()} is a crypto asset — skipping NYSE market hours check.")
+        elif not is_market_open():
             logger.error("Strategy aborted — market is not open.")
             sys.exit(1)
 
