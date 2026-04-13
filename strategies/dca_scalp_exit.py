@@ -1,12 +1,12 @@
 """
-strategies/dca_scalp_exit.py  -  Exit all open DCA positions at a profit target.
+strategies/dca_scalp_exit.py  -  Exit all open DCA positions lot by lot.
 
-Queries all open lots from the IBKR executions API (FIFO-matched buys vs sells),
-computes the weighted average cost, then sells EVERYTHING in one order when the
-current price is >= avg_cost * (1 + profit_pct / 100).
+Queries open lots from the IBKR executions API (FIFO-matched buys vs sells)
+and checks each lot individually every `check_frequency` seconds.
+Sells a lot as soon as its current price is >= its buy price * (1 + profit_pct).
 
-Runs indefinitely until all positions are fully closed, then prints a final
-P&L summary and exits.
+Runs indefinitely until every open lot has been sold, then prints a final
+realized P&L summary and exits cleanly.
 
 Invoked by:
   python main.py -sym BTC  -strat dca_scalp_exit
@@ -264,12 +264,11 @@ def run(symbol: str, params: dict = None):
     logger.info(sep)
     logger.info(f"  DCA Scalp Exit  --  {symbol}")
     logger.info(sep)
-    logger.info(f"  Sell target     : +{p['profit_pct']:.2f}%")
+    logger.info(f"  Sell target     : +{p['profit_pct']:.2f}% per lot")
     logger.info(f"  Check every     : {check_frequency}s")
     logger.info(sep)
 
     total_realized = 0.0
-    total_cost     = 0.0
     stop_event     = threading.Event()
 
     try:
@@ -286,48 +285,40 @@ def run(symbol: str, params: dict = None):
                 stop_event.wait(check_frequency)
                 continue
 
-            # Compute weighted average cost across all open lots
-            total_shares   = sum(lot["shares"] for lot in open_lots)
-            total_lot_cost = sum(lot["shares"] * lot["buy_price"] for lot in open_lots)
-            avg_cost       = total_lot_cost / total_shares
-            current_value  = total_shares * price
-            pct_gain       = (price - avg_cost) / avg_cost
-
             logger.info(
                 f"[CHECK] {symbol} @ ${price:,.2f}  "
                 f"open lots: {len(open_lots)}  "
-                f"total: {total_shares:.6g} shares  "
-                f"avg cost: ${avg_cost:,.2f}  "
-                f"P&L: {pct_gain*100:+.2f}%  "
                 f"target: +{p['profit_pct']:.2f}%"
             )
 
-            if pct_gain >= profit_target:
+            # Check each lot individually — sell as soon as it hits the target
+            for i, lot in enumerate(open_lots, 1):
+                pct = (price - lot["buy_price"]) / lot["buy_price"]
+                status = "-> SELL" if pct >= profit_target else "-> holding"
                 logger.info(
-                    f"[EXIT]  Target reached! Selling all {total_shares:.6g} {symbol} "
-                    f"@ ${price:,.2f}"
-                )
-                order_id = app.next_order_id
-                app.next_order_id += 1
-                order = tws.make_order("SELL", total_shares, crypto=crypto)
-                app.placeOrder(order_id, contract, order)
-
-                profit          = current_value - total_lot_cost
-                total_realized += profit
-                total_cost     += total_lot_cost
-
-                logger.info(
-                    f"[EXIT]  Sell order placed  "
-                    f"cost basis: ${total_lot_cost:,.2f}  "
-                    f"value: ${current_value:,.2f}  "
-                    f"profit: ${profit:,.2f} ({pct_gain*100:+.2f}%)"
+                    f"  lot {i}: {lot['shares']:.6g} @ ${lot['buy_price']:,.2f}  "
+                    f"now {pct*100:+.2f}%  {status}"
                 )
 
-                # Wait a moment for the order to process, then re-check
-                # (IOC fills may be partial -- loop continues until all closed)
-                stop_event.wait(check_frequency)
-            else:
-                stop_event.wait(check_frequency)
+                if pct >= profit_target:
+                    order_id = app.next_order_id
+                    app.next_order_id += 1
+                    order = tws.make_order("SELL", lot["shares"], crypto=crypto)
+                    app.placeOrder(order_id, contract, order)
+
+                    sell_value      = lot["shares"] * price
+                    cost_basis      = lot["shares"] * lot["buy_price"]
+                    profit          = sell_value - cost_basis
+                    total_realized += profit
+
+                    logger.info(
+                        f"[SELL] {lot['shares']:.6g} {symbol} @ ${price:,.2f}  "
+                        f"bought @ ${lot['buy_price']:,.2f}  "
+                        f"profit=${profit:,.2f} ({pct*100:+.2f}%)  "
+                        f"total realized=${total_realized:,.2f}"
+                    )
+
+            stop_event.wait(check_frequency)
 
     except KeyboardInterrupt:
         logger.info("Interrupted -- shutting down.")
