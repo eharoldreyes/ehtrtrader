@@ -123,6 +123,7 @@ class IBKRApp(EWrapper, EClient):
         self._ready         = threading.Event()
         self.order_statuses = {}  # orderId -> status
         self.executions     = []  # list of (contract, execution) tuples
+        self.commissions    = {}  # execId -> commission (USD)
         self._exec_done     = threading.Event()
 
     def nextValidId(self, orderId: int):
@@ -156,6 +157,10 @@ class IBKRApp(EWrapper, EClient):
 
     def execDetailsEnd(self, reqId):
         self._exec_done.set()
+
+    def commissionReport(self, commissionReport):
+        """Store commission per execution so P&L can include trading costs."""
+        self.commissions[commissionReport.execId] = commissionReport.commission
 
 
 # ── Connection ────────────────────────────────────────────────────────────────
@@ -270,39 +275,45 @@ def get_trades(app: IBKRApp, symbol: str = None):
         logger.info(f"No executions found for {label}.")
         return
 
-    col = "{:<12} {:<6} {:<10} {:<12} {:<12} {:<20}"
-    header = col.format("Symbol", "Side", "Qty", "Price", "Value", "Time")
+    col = "{:<12} {:<6} {:<10} {:<12} {:<12} {:<12} {:<20}"
+    header = col.format("Symbol", "Side", "Qty", "Price", "Value", "Commission", "Time")
     sep = "-" * len(header)
     print(f"\n{sep}")
     print(header)
     print(sep)
 
     for contract, ex in app.executions:
-        value = ex.shares * ex.price
+        value      = ex.shares * ex.price
+        commission = app.commissions.get(ex.execId, 0.0)
         print(col.format(
             contract.symbol,
             ex.side,
             f"{ex.shares:.6g}",
             f"${ex.price:,.2f}",
             f"${value:,.2f}",
+            f"${commission:,.4f}",
             ex.time,
         ))
 
     print(sep)
     print(f"  {len(app.executions)} execution(s)\n")
 
-    summarize_trades(app.executions)
+    summarize_trades(app.executions, app.commissions)
 
 
-def summarize_trades(executions: list):
-    """Print a P&L summary grouped by symbol."""
-    totals = {}  # symbol -> {bought_qty, bought_val, sold_qty, sold_val}
+def summarize_trades(executions: list, commissions: dict = None):
+    """Print a P&L summary grouped by symbol, including IBKR commissions."""
+    commissions = commissions or {}
+    totals = {}  # symbol -> {bought_qty, bought_val, sold_qty, sold_val, commission}
 
     for contract, ex in executions:
         sym = contract.symbol
         if sym not in totals:
-            totals[sym] = {"bought_qty": 0.0, "bought_val": 0.0,
-                           "sold_qty":   0.0, "sold_val":   0.0}
+            totals[sym] = {
+                "bought_qty": 0.0, "bought_val": 0.0,
+                "sold_qty":   0.0, "sold_val":   0.0,
+                "commission": 0.0,
+            }
         value = ex.shares * ex.price
         if ex.side == "BOT":
             totals[sym]["bought_qty"] += ex.shares
@@ -310,17 +321,22 @@ def summarize_trades(executions: list):
         else:
             totals[sym]["sold_qty"]  += ex.shares
             totals[sym]["sold_val"]  += value
+        totals[sym]["commission"] += commissions.get(ex.execId, 0.0)
 
-    col = "{:<12} {:<12} {:<14} {:<12} {:<14} {:<12} {:<12}"
-    header = col.format("Symbol", "Bot Qty", "Bot Value", "Sld Qty", "Sld Value", "Net Qty", "Realized P&L")
+    col = "{:<12} {:<12} {:<14} {:<12} {:<14} {:<12} {:<14} {:<12} {:<12}"
+    header = col.format(
+        "Symbol", "Bot Qty", "Bot Value", "Sld Qty", "Sld Value",
+        "Net Qty", "Gross P&L", "Commission", "Net P&L",
+    )
     sep = "-" * len(header)
     print(sep)
     print(header)
     print(sep)
 
     for sym, t in totals.items():
-        net_qty  = t["bought_qty"] - t["sold_qty"]
-        realized = t["sold_val"] - t["bought_val"]  # positive = profit
+        net_qty    = t["bought_qty"] - t["sold_qty"]
+        gross_pnl  = t["sold_val"]  - t["bought_val"]   # positive = profit
+        net_pnl    = gross_pnl - t["commission"]
         print(col.format(
             sym,
             f"{t['bought_qty']:.6g}",
@@ -328,7 +344,9 @@ def summarize_trades(executions: list):
             f"{t['sold_qty']:.6g}",
             f"${t['sold_val']:,.2f}",
             f"{net_qty:.6g}",
-            f"${realized:,.2f}",
+            f"${gross_pnl:,.2f}",
+            f"${t['commission']:,.4f}",
+            f"${net_pnl:,.2f}",
         ))
 
     print(sep + "\n")
