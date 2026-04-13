@@ -159,8 +159,13 @@ class IBKRApp(EWrapper, EClient):
         self._exec_done.set()
 
     def commissionReport(self, commissionReport):
-        """Store commission per execution so P&L can include trading costs."""
-        self.commissions[commissionReport.execId] = commissionReport.commission
+        """Store commission per execution so P&L can include trading costs.
+        IBKR sends 1.7976931348623157E308 as a sentinel when commission is
+        not yet calculated — treat that as zero to avoid garbage output."""
+        commission = commissionReport.commission
+        if commission >= 1e300:   # sentinel value — commission not yet available
+            commission = 0.0
+        self.commissions[commissionReport.execId] = commission
 
 
 # ── Connection ────────────────────────────────────────────────────────────────
