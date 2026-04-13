@@ -10,6 +10,7 @@ To add a new strategy:
 from strategies import trailing_stop_loss
 from strategies import supply_demand
 from strategies import dca_scalp
+from strategies import dca_scalp_exit
 
 # Registry maps strategy name → module
 # Each module must expose:
@@ -19,6 +20,7 @@ REGISTRY: dict[str, object] = {
     "trailing_stop_loss": trailing_stop_loss,
     "supply_demand":      supply_demand,
     "dca_scalp":          dca_scalp,
+    "dca_scalp_exit":     dca_scalp_exit,
 }
 
 
