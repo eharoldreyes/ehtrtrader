@@ -13,7 +13,7 @@ import argparse
 import threading
 from pathlib import Path
 from dotenv import load_dotenv
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 import os
 
@@ -81,31 +81,56 @@ def format_duration(total_hours: float) -> str:
 
 
 # ── Market hours check ───────────────────────────────────────────────────────
-MARKET_OPEN  = dtime(9, 30)
-MARKET_CLOSE = dtime(16, 0)
-ET           = ZoneInfo("America/New_York")
+MARKET_OPEN   = dtime(9, 30)
+MARKET_CLOSE  = dtime(16, 0)
+ET            = ZoneInfo("America/New_York")
+PHT           = ZoneInfo("Asia/Manila")
 NYSE_HOLIDAYS = holidays.NYSE()
+
+
+def next_market_open_pht() -> str:
+    """Return the next NYSE open time as a human-readable PH time string."""
+    now = datetime.now(ET)
+    candidate = now.replace(hour=9, minute=30, second=0, microsecond=0)
+
+    # If we're already past open today, start checking from tomorrow
+    if now.time().replace(tzinfo=None) >= MARKET_OPEN:
+        candidate += timedelta(days=1)
+
+    # Advance past weekends and holidays
+    while candidate.weekday() >= 5 or candidate.date() in NYSE_HOLIDAYS:
+        candidate += timedelta(days=1)
+
+    pht_time = candidate.astimezone(PHT)
+    return pht_time.strftime("%A, %b %d at %I:%M %p PH time")
 
 
 def is_market_open() -> bool:
     """Return True if the NYSE is currently open for regular trading."""
-    now  = datetime.now(ET)
+    now   = datetime.now(ET)
     today = now.date()
 
     if now.weekday() >= 5:                  # Saturday=5, Sunday=6
-        logger.warning(f"Market closed — it's the weekend ({now.strftime('%A')}).")
+        logger.warning(
+            f"Market closed — it's the weekend ({now.strftime('%A')}). "
+            f"Try again {next_market_open_pht()}."
+        )
         return False
 
     if today in NYSE_HOLIDAYS:
         holiday_name = NYSE_HOLIDAYS.get(today)
-        logger.warning(f"Market closed — NYSE holiday: {holiday_name}.")
+        logger.warning(
+            f"Market closed — NYSE holiday: {holiday_name}. "
+            f"Try again {next_market_open_pht()}."
+        )
         return False
 
     current_time = now.time().replace(tzinfo=None)
     if not (MARKET_OPEN <= current_time < MARKET_CLOSE):
         logger.warning(
             f"Market closed — current ET time is {now.strftime('%H:%M')}. "
-            f"Regular hours: 09:30–16:00 ET."
+            f"Regular hours: 09:30-16:00 ET. "
+            f"Try again {next_market_open_pht()}."
         )
         return False
 
