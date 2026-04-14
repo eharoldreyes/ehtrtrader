@@ -306,38 +306,37 @@ def run(symbol: str, params: dict = None):
                 stop_event.wait(buy_frequency)
                 continue
 
+            # Build the order outside the lock (no shared state needed yet)
+            if crypto:
+                order  = tws.make_order("BUY", amount, use_cash_qty=True, crypto=True)
+                shares = amount / price
+                cost   = amount
+            else:
+                shares = math.floor(amount / price)
+                if shares == 0:
+                    logger.warning(
+                        f"${amount:.2f} too small to buy 1 share of "
+                        f"{symbol} at ${price:.2f} -- skipping."
+                    )
+                    stop_event.wait(buy_frequency)
+                    continue
+                order = tws.make_order("BUY", shares)
+                cost  = shares * price
+
+            # Lock only for the minimum time needed: read/write shared state
             with lock:
                 if budget < amount:
                     stop_event.wait(buy_frequency)
                     continue
-
                 order_id = app.next_order_id
                 app.next_order_id += 1
-
-                if crypto:
-                    order  = tws.make_order("BUY", amount, use_cash_qty=True, crypto=True)
-                    shares = amount / price
-                    cost   = amount
-                else:
-                    shares = math.floor(amount / price)
-                    if shares == 0:
-                        logger.warning(
-                            f"${amount:.2f} too small to buy 1 share of "
-                            f"{symbol} at ${price:.2f} -- skipping."
-                        )
-                        stop_event.wait(buy_frequency)
-                        continue
-                    order = tws.make_order("BUY", shares)
-                    cost  = shares * price
-
                 app.placeOrder(order_id, contract, order)
                 budget -= cost
 
-                logger.info(
-                    f"[BUY]  {shares:.6g} {symbol} @ ${price:.2f}  "
-                    f"cost=${cost:.2f}  budget=${budget:.2f}"
-                )
-
+            logger.info(
+                f"[BUY]  {shares:.6g} {symbol} @ ${price:.2f}  "
+                f"cost=${cost:.2f}  budget=${budget:.2f}"
+            )
             stop_event.wait(buy_frequency)
 
     # ── Sell loop (Schedule 2) ────────────────────────────────────────────────
@@ -351,12 +350,9 @@ def run(symbol: str, params: dict = None):
             if not price:
                 continue
 
-            with lock:
-                open_lots = app.get_open_lots(symbol)
-
-            if not open_lots:
-                logger.debug(f"[CHECK] No open lots for {symbol}.")
-                continue
+            # Query IBKR executions outside the lock — this is a network call
+            # that can wait up to 10s and must never block the buy loop.
+            open_lots = app.get_open_lots(symbol)
 
             winning = sum(1 for lot in open_lots
                          if (price - lot["buy_price"]) / lot["buy_price"] > 0)
@@ -367,21 +363,20 @@ def run(symbol: str, params: dict = None):
                 f"lots: {len(open_lots)}  "
                 f"winning: {winning}  losing: {losing}"
             )
+
             for lot in open_lots:
                 pct = (price - lot["buy_price"]) / lot["buy_price"]
                 if pct >= sell_target:
+                    order = tws.make_order("SELL", lot["shares"], crypto=crypto)
+
+                    # Lock only for the minimum time: read/write shared state
                     with lock:
                         order_id = app.next_order_id
                         app.next_order_id += 1
-
-                    order = tws.make_order("SELL", lot["shares"], crypto=crypto)
-                    app.placeOrder(order_id, contract, order)
-
-                    sell_value = lot["shares"] * price
-                    profit     = sell_value - (lot["shares"] * lot["buy_price"])
-
-                    with lock:
-                        budget += sell_value
+                        app.placeOrder(order_id, contract, order)
+                        sell_value = lot["shares"] * price
+                        profit     = sell_value - (lot["shares"] * lot["buy_price"])
+                        budget    += sell_value
 
                     # A sell reduces crypto exposure — allow buys to resume
                     app._crypto_limit_hit = False
