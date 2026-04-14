@@ -340,14 +340,13 @@ def run(symbol: str, params: dict = None):
                 continue
 
             winning = sum(1 for lot in open_lots
-                         if (price - lot["buy_price"]) / lot["buy_price"] >= sell_target)
+                         if (price - lot["buy_price"]) / lot["buy_price"] > 0)
             losing  = sum(1 for lot in open_lots
                          if (price - lot["buy_price"]) / lot["buy_price"] < 0)
             logger.info(
                 f"[CHECK] {symbol} @ ${price:.2f}  "
                 f"lots: {len(open_lots)}  "
-                f"winning: {winning}  losing: {losing}  "
-                f"target: +{sell_target*100:.2f}%"
+                f"winning: {winning}  losing: {losing}"
             )
             for lot in open_lots:
                 pct = (price - lot["buy_price"]) / lot["buy_price"]
