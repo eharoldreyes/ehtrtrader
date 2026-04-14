@@ -138,6 +138,9 @@ celerybeat.pid
 
 # Environments
 .env
+
+# Runtime price cache (shared across bot processes)
+.price_cache.json
 .envrc
 .venv
 env/
