@@ -3,3 +3,4 @@ loguru==0.7.3
 python-dotenv==1.2.2
 holidays==0.94
 tzdata==2026.1
+websocket-client==1.8.0

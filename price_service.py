@@ -1,23 +1,23 @@
 """
-price_service.py  -  Singleton price cache with background polling.
+price_service.py  -  Singleton price cache with real-time WebSocket streaming.
 
-Works across multiple bot processes via a shared file cache
-(.price_cache.json). Process 1 fetches from Binance and writes the
-file; Process 2 reads the file and skips the API call if the data
-is still fresh. This prevents rate-limiting when running several
-instances simultaneously.
+Price source priority:
+  1. Binance WebSocket (primary)  — real-time push on every trade, no rate limit
+  2. Binance REST (fallback)      — polled every POLL_INTERVAL if WS is down
+  3. Coinbase REST (fallback)     — used if Binance REST also fails
 
-Within a single process, a thread-safe in-memory singleton is used
-so strategies share one polling thread instead of each calling the
-API independently.
+Cross-process sharing:
+  All bot instances share a .price_cache.json file so multiple processes
+  never duplicate API calls. Process 1 fetches and writes; Process 2 reads
+  the file and skips the request if the data is still fresh.
 
 Usage:
     import price_service
 
-    svc = price_service.get()          # returns the singleton, starts polling
-    svc.subscribe("BTC")               # add to watch-list (auto-saves to .env)
-    price = svc.get_price("BTC")       # latest cached price (non-blocking)
-    svc.update("AAPL", 195.40)         # strategies push stock prices in
+    svc = price_service.get()      # singleton, starts WS + fallback threads
+    svc.subscribe("BTC")           # watch a symbol (auto-saves to .env)
+    price = svc.get_price("BTC")   # latest cached price (non-blocking)
+    svc.update("AAPL", 195.40)     # strategies push stock prices in
 """
 
 import re
@@ -27,13 +27,18 @@ import threading
 import urllib.request
 from pathlib import Path
 
+import websocket
 from loguru import logger
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-POLL_INTERVAL = 10.0   # seconds between crypto batch fetches
-CACHE_TTL     = 10.0   # seconds before a price is considered stale
+POLL_INTERVAL  = 10.0   # seconds between REST fallback polls
+CACHE_TTL      = 10.0   # seconds before a price is considered stale
+WS_RECONNECT   = 5.0    # seconds to wait before reconnecting WebSocket
 
 CRYPTO_SYMBOLS = {"BTC", "ETH", "LTC", "BCH"}
+
+BINANCE_WS_BASE  = "wss://stream.binance.com:9443/stream"
+BINANCE_REST_URL = "https://api.binance.com/api/v3/ticker/price"
 
 BINANCE_SYMBOLS = {
     "BTC": "BTCUSDT",
@@ -41,12 +46,14 @@ BINANCE_SYMBOLS = {
     "LTC": "LTCUSDT",
     "BCH": "BCHUSDT",
 }
+# Reverse map: "BTCUSDT" -> "BTC"
+BINANCE_REVERSE = {v: k for k, v in BINANCE_SYMBOLS.items()}
 
-COINGECKO_IDS = {
-    "BTC": "bitcoin",
-    "ETH": "ethereum",
-    "LTC": "litecoin",
-    "BCH": "bitcoin-cash",
+COINBASE_SYMBOLS = {
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+    "LTC": "LTC-USD",
+    "BCH": "BCH-USD",
 }
 
 ENV_PATH        = Path(__file__).parent / ".env"
@@ -55,10 +62,7 @@ FILE_CACHE_PATH = Path(__file__).parent / ".price_cache.json"
 
 # ── Shared file cache (cross-process) ─────────────────────────────────────────
 def _file_cache_read(symbol: str) -> float | None:
-    """
-    Read a price from the shared file cache.
-    Returns the price if it exists and is within CACHE_TTL, else None.
-    """
+    """Return a cached price if it exists and is within CACHE_TTL, else None."""
     try:
         data  = json.loads(FILE_CACHE_PATH.read_text(encoding="utf-8"))
         entry = data.get(symbol.upper())
@@ -70,7 +74,7 @@ def _file_cache_read(symbol: str) -> float | None:
 
 
 def _file_cache_write(symbol: str, price: float) -> None:
-    """Write a price into the shared file cache (merge with existing entries)."""
+    """Merge a price into the shared file cache."""
     try:
         data = {}
         if FILE_CACHE_PATH.exists():
@@ -88,11 +92,11 @@ def _file_cache_write(symbol: str, price: float) -> None:
 class PriceService:
     """
     Thread-safe singleton price cache.
-    - Crypto: background thread polls Binance (batched) every POLL_INTERVAL.
-              Before every API call, checks the shared file cache first so
-              multiple processes don't duplicate requests.
-    - Stocks: strategies push prices in via update(); other instances within
-              CACHE_TTL read from cache without touching IBKR again.
+
+    Two background threads run concurrently:
+      _ws_thread       — Binance WebSocket listener. Reconnects automatically.
+      _fallback_thread — Binance REST + Coinbase REST. Only fetches when the
+                         WebSocket has been down for a full POLL_INTERVAL.
     """
 
     _instance      = None
@@ -102,19 +106,26 @@ class PriceService:
         with cls._instance_lock:
             if cls._instance is None:
                 inst = super().__new__(cls)
-                inst._prices:  dict[str, float] = {}
-                inst._updated: dict[str, float] = {}
-                inst._symbols: set[str]         = set()
-                inst._lock    = threading.Lock()
-                inst._stop    = threading.Event()
-                inst._thread  = None
+                inst._prices:       dict[str, float] = {}
+                inst._updated:      dict[str, float] = {}
+                inst._symbols:      set[str]          = set()
+                inst._lock          = threading.Lock()
+                inst._stop          = threading.Event()
+                inst._ws_thread     = None
+                inst._fallback_thread = None
+                inst._ws_connected  = False
+                inst._ws            = None   # active WebSocketApp
                 cls._instance = inst
         return cls._instance
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def subscribe(self, symbol: str) -> None:
-        """Add a symbol to the watch-list. Persists to .env WATCHLIST if new."""
+        """
+        Add a symbol to the watch-list.
+        Persists to .env WATCHLIST if new, and triggers a WS reconnect so
+        the new symbol is immediately included in the stream.
+        """
         symbol = symbol.upper()
         with self._lock:
             if symbol in self._symbols:
@@ -124,14 +135,18 @@ class PriceService:
         logger.info(f"[PriceService] Subscribed to {symbol}.")
         _add_to_watchlist(symbol)
 
+        # Reconnect WebSocket so the new symbol's stream is included
+        if self._ws:
+            self._ws.close()
+
     def get_price(self, symbol: str) -> float | None:
-        """Return the latest cached price (non-blocking). None if not yet available."""
+        """Return the latest cached price (non-blocking). None if unavailable."""
         symbol = symbol.upper()
         with self._lock:
             price = self._prices.get(symbol)
         if price:
             return price
-        # Also check the file cache (may have been written by another process)
+        # Check file cache — another process may have written a fresh price
         price = _file_cache_read(symbol)
         if price:
             self._set(symbol, price)
@@ -144,17 +159,14 @@ class PriceService:
         return (time.time() - ts) > CACHE_TTL
 
     def update(self, symbol: str, price: float) -> None:
-        """
-        Push a freshly-fetched price into both the in-memory and file cache.
-        Called by strategies after each IBKR historical-data fetch.
-        """
+        """Push a price into both caches. Used by strategies for stock prices."""
         symbol = symbol.upper()
         self._set(symbol, price)
         _file_cache_write(symbol, price)
         logger.debug(f"[PriceService] Updated {symbol} = ${price:,.2f}")
 
     def wait_for_price(self, symbol: str, timeout: float = 15.0) -> float | None:
-        """Block until a price is available (up to timeout seconds)."""
+        """Block until a price is available, up to timeout seconds."""
         symbol   = symbol.upper()
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -166,100 +178,184 @@ class PriceService:
         return None
 
     def start(self) -> None:
-        """Start the background crypto polling thread (idempotent)."""
-        if self._thread and self._thread.is_alive():
+        """Start the WebSocket and fallback threads (idempotent)."""
+        if self._ws_thread and self._ws_thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._poll_loop, daemon=True, name="price-service"
+        self._ws_thread = threading.Thread(
+            target=self._ws_loop, daemon=True, name="price-ws"
         )
-        self._thread.start()
-        logger.debug("[PriceService] Background polling thread started.")
+        self._fallback_thread = threading.Thread(
+            target=self._fallback_loop, daemon=True, name="price-fallback"
+        )
+        self._ws_thread.start()
+        self._fallback_thread.start()
+        logger.debug("[PriceService] WebSocket + fallback threads started.")
 
     def stop(self) -> None:
-        """Signal the polling thread to stop."""
+        """Signal both threads to stop."""
         self._stop.set()
+        if self._ws:
+            self._ws.close()
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _set(self, symbol: str, price: float) -> None:
-        """Update in-memory cache only (no file write)."""
+        """Update in-memory cache only."""
         with self._lock:
             self._prices[symbol]  = price
             self._updated[symbol] = time.time()
 
-    # ── Background polling ────────────────────────────────────────────────────
+    def _crypto_symbols(self) -> list[str]:
+        with self._lock:
+            return [s for s in self._symbols if s in CRYPTO_SYMBOLS]
 
-    def _poll_loop(self) -> None:
+    # ── WebSocket thread ──────────────────────────────────────────────────────
+
+    def _ws_loop(self) -> None:
+        """Maintain a persistent Binance WebSocket connection. Auto-reconnects."""
         while not self._stop.is_set():
-            with self._lock:
-                crypto = [s for s in self._symbols if s in CRYPTO_SYMBOLS]
-            if crypto:
-                self._refresh_crypto(crypto)
-            self._stop.wait(POLL_INTERVAL)
-
-    def _refresh_crypto(self, symbols: list[str]) -> None:
-        """
-        Refresh crypto prices. For each symbol, check the shared file cache
-        first — if another process already fetched a fresh price, use it and
-        skip the API call entirely.
-        """
-        stale = []
-        for sym in symbols:
-            cached = _file_cache_read(sym)
-            if cached:
-                self._set(sym, cached)   # sync in-memory from file
-                logger.debug(f"[PriceService] {sym} served from file cache (${cached:,.2f})")
-            else:
-                stale.append(sym)
-
-        if not stale:
-            return
-
-        # ── Binance batch request ─────────────────────────────────────────────
-        pairs = [BINANCE_SYMBOLS[s] for s in stale if s in BINANCE_SYMBOLS]
-        if pairs:
-            try:
-                # Pass the symbols array as a literal JSON string (no extra encoding)
-                # Binance expects: ?symbols=["BTCUSDT","ETHUSDT"]
-                symbols_param = json.dumps(pairs, separators=(",", ":"))
-                url = f"https://api.binance.com/api/v3/ticker/price?symbols={symbols_param}"
-                with urllib.request.urlopen(url, timeout=5) as resp:
-                    data = json.loads(resp.read())
-                reverse = {v: k for k, v in BINANCE_SYMBOLS.items()}
-                for item in data:
-                    sym = reverse.get(item["symbol"])
-                    if sym:
-                        price = float(item["price"])
-                        self._set(sym, price)
-                        _file_cache_write(sym, price)
-                        stale = [s for s in stale if s != sym]
-                logger.debug(f"[PriceService] Binance batch updated: {', '.join(symbols)}")
-                return
-            except Exception as e:
-                logger.warning(f"[PriceService] Binance batch fetch failed: {e} -- falling back to CoinGecko.")
-
-        # ── CoinGecko fallback (individual, only for symbols Binance missed) ──
-        for sym in stale:
-            coin_id = COINGECKO_IDS.get(sym)
-            if not coin_id:
+            symbols = self._crypto_symbols()
+            if not symbols:
+                self._stop.wait(1)
                 continue
-            try:
-                url = (
-                    f"https://api.coingecko.com/api/v3/simple/price"
-                    f"?ids={coin_id}&vs_currencies=usd"
+
+            streams = "/".join(
+                f"{BINANCE_SYMBOLS[s].lower()}@aggTrade"
+                for s in symbols
+                if s in BINANCE_SYMBOLS
+            )
+            url = f"{BINANCE_WS_BASE}?streams={streams}"
+
+            logger.info(f"[PriceService] Connecting WebSocket for: {', '.join(symbols)}")
+
+            self._ws = websocket.WebSocketApp(
+                url,
+                on_open    = self._on_ws_open,
+                on_message = self._on_ws_message,
+                on_error   = self._on_ws_error,
+                on_close   = self._on_ws_close,
+            )
+            # run_forever blocks until disconnect
+            self._ws.run_forever(ping_interval=30, ping_timeout=10)
+
+            if not self._stop.is_set():
+                logger.warning(
+                    f"[PriceService] WebSocket disconnected. "
+                    f"Reconnecting in {WS_RECONNECT:.0f}s ..."
                 )
-                with urllib.request.urlopen(url, timeout=5) as resp:
-                    price = float(json.loads(resp.read())[coin_id]["usd"])
+                self._stop.wait(WS_RECONNECT)
+
+    def _on_ws_open(self, ws) -> None:
+        self._ws_connected = True
+        logger.info("[PriceService] WebSocket connected. Receiving live prices.")
+
+    def _on_ws_message(self, ws, raw: str) -> None:
+        try:
+            msg  = json.loads(raw)
+            data = msg.get("data", msg)   # combined stream wraps in {"stream":..,"data":..}
+            if data.get("e") != "aggTrade":
+                return
+            pair  = data["s"]             # e.g. "BTCUSDT"
+            price = float(data["p"])      # last trade price
+            sym   = BINANCE_REVERSE.get(pair)
+            if sym:
                 self._set(sym, price)
                 _file_cache_write(sym, price)
+        except Exception as e:
+            logger.debug(f"[PriceService] WS message parse error: {e}")
+
+    def _on_ws_error(self, ws, error) -> None:
+        logger.warning(f"[PriceService] WebSocket error: {error}")
+        self._ws_connected = False
+
+    def _on_ws_close(self, ws, code, msg) -> None:
+        self._ws_connected = False
+        logger.debug(f"[PriceService] WebSocket closed (code={code}).")
+
+    # ── Fallback REST thread ──────────────────────────────────────────────────
+
+    def _fallback_loop(self) -> None:
+        """
+        Poll REST sources only when the WebSocket is down.
+        Checks file cache first so multiple processes don't duplicate calls.
+        """
+        while not self._stop.is_set():
+            self._stop.wait(POLL_INTERVAL)
+
+            if self._ws_connected:
+                continue   # WebSocket is healthy — nothing to do
+
+            symbols = self._crypto_symbols()
+            if not symbols:
+                continue
+
+            logger.debug("[PriceService] WS down — polling REST fallback.")
+
+            stale = []
+            for sym in symbols:
+                cached = _file_cache_read(sym)
+                if cached:
+                    self._set(sym, cached)
+                else:
+                    stale.append(sym)
+
+            if not stale:
+                continue
+
+            # ── Binance REST ──────────────────────────────────────────────────
+            remaining = self._fetch_binance_rest(stale)
+
+            # ── Coinbase REST (for any symbols Binance REST missed) ───────────
+            if remaining:
+                self._fetch_coinbase_rest(remaining)
+
+    def _fetch_binance_rest(self, symbols: list[str]) -> list[str]:
+        """
+        Fetch prices via Binance REST batch endpoint.
+        Returns the list of symbols that still need fetching (on failure).
+        """
+        pairs = [BINANCE_SYMBOLS[s] for s in symbols if s in BINANCE_SYMBOLS]
+        if not pairs:
+            return symbols
+        try:
+            symbols_param = json.dumps(pairs, separators=(",", ":"))
+            url = f"{BINANCE_REST_URL}?symbols={symbols_param}"
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                data = json.loads(resp.read())
+            for item in data:
+                sym = BINANCE_REVERSE.get(item["symbol"])
+                if sym:
+                    price = float(item["price"])
+                    self._set(sym, price)
+                    _file_cache_write(sym, price)
+            logger.debug(f"[PriceService] Binance REST updated: {', '.join(symbols)}")
+            return []   # all fetched
+        except Exception as e:
+            logger.warning(f"[PriceService] Binance REST failed: {e} -- trying Coinbase.")
+            return symbols
+
+    def _fetch_coinbase_rest(self, symbols: list[str]) -> None:
+        """Fetch prices from Coinbase public REST API (no auth required)."""
+        for sym in symbols:
+            pair = COINBASE_SYMBOLS.get(sym)
+            if not pair:
+                continue
+            try:
+                url = f"https://api.coinbase.com/v2/prices/{pair}/spot"
+                with urllib.request.urlopen(url, timeout=5) as resp:
+                    data  = json.loads(resp.read())
+                    price = float(data["data"]["amount"])
+                self._set(sym, price)
+                _file_cache_write(sym, price)
+                logger.debug(f"[PriceService] Coinbase REST: {sym} = ${price:,.2f}")
             except Exception as e:
-                logger.warning(f"[PriceService] CoinGecko failed for {sym}: {e}")
+                logger.warning(f"[PriceService] Coinbase REST failed for {sym}: {e}")
 
 
 # ── Module-level accessor ─────────────────────────────────────────────────────
 def get() -> PriceService:
-    """Return the singleton PriceService, starting the polling thread if needed."""
+    """Return the singleton PriceService, starting threads if needed."""
     svc = PriceService()
     svc.start()
     return svc
