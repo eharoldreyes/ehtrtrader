@@ -24,6 +24,7 @@ from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
 from ibapi.order import Order
 from ibapi.execution import ExecutionFilter
+import price_service
 
 # ── Load .env ─────────────────────────────────────────────────────────────────
 load_dotenv(Path(__file__).parent / ".env")
@@ -32,6 +33,11 @@ TWS_HOST  = os.getenv("TWS_HOST", "127.0.0.1")
 TWS_PORT  = int(os.getenv("TWS_PORT", 7497))
 CLIENT_ID = int(os.getenv("CLIENT_ID", 1))
 WATCHLIST = [t.strip() for t in os.getenv("WATCHLIST", "").split(",") if t.strip()]
+
+# Subscribe all watchlist symbols to the price service on startup
+_svc = price_service.get()
+for _sym in WATCHLIST:
+    _svc.subscribe(_sym)
 
 
 # ── Duration parser ───────────────────────────────────────────────────────────
@@ -498,6 +504,8 @@ if __name__ == "__main__":
         if not args.sym:
             parser.error("Strategy mode requires: -sym")
 
+        price_service.get().subscribe(args.sym.upper())
+
         if is_crypto(args.sym.upper()):
             logger.info(f"{args.sym.upper()} is a crypto asset — skipping NYSE market hours check.")
         elif not is_market_open():
@@ -545,6 +553,7 @@ if __name__ == "__main__":
             parser.error(f"{args.command} requires <symbol> <quantity>  (prefix $ for USD, e.g. $100)")
 
         sym = args.cmd_sym.upper()
+        price_service.get().subscribe(sym)
         qty_raw = args.cmd_qty
 
         use_cash_qty = qty_raw.startswith("$")

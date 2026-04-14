@@ -17,75 +17,13 @@ Invoked by:
 import sys
 import math
 import time
-import json
 import threading
-import urllib.request
 from zoneinfo import ZoneInfo
 
 from ibapi.execution import ExecutionFilter
 from loguru import logger
 import main as tws
-
-# ── CoinGecko fallback for crypto prices (bypasses IBKR API version limit) ───
-# Binance symbol map (primary — no auth, 1200 req/min)
-BINANCE_SYMBOLS = {
-    "BTC": "BTCUSDT",
-    "ETH": "ETHUSDT",
-    "LTC": "LTCUSDT",
-    "BCH": "BCHUSDT",
-}
-
-# CoinGecko symbol map (fallback)
-COINGECKO_IDS = {
-    "BTC": "bitcoin",
-    "ETH": "ethereum",
-    "LTC": "litecoin",
-    "BCH": "bitcoin-cash",
-}
-
-PRICE_CACHE_TTL = 10   # seconds
-_price_cache: dict[str, tuple[float, float]] = {}   # symbol -> (price, timestamp)
-
-
-def _fetch_binance(symbol: str) -> float | None:
-    pair = BINANCE_SYMBOLS.get(symbol)
-    if not pair:
-        return None
-    url = f"https://api.binance.com/api/v3/ticker/price?symbol={pair}"
-    with urllib.request.urlopen(url, timeout=5) as resp:
-        return float(json.loads(resp.read())["price"])
-
-
-def _fetch_coingecko(symbol: str) -> float | None:
-    coin_id = COINGECKO_IDS.get(symbol)
-    if not coin_id:
-        return None
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
-    with urllib.request.urlopen(url, timeout=5) as resp:
-        return float(json.loads(resp.read())[coin_id]["usd"])
-
-
-def get_crypto_price(symbol: str) -> float | None:
-    """
-    Fetch crypto price. Uses Binance first (generous rate limits),
-    falls back to CoinGecko. Results cached for PRICE_CACHE_TTL seconds.
-    """
-    symbol = symbol.upper()
-    cached_price, cached_at = _price_cache.get(symbol, (None, 0))
-    if cached_price and (time.time() - cached_at) < PRICE_CACHE_TTL:
-        return cached_price
-
-    for name, fetcher in [("Binance", _fetch_binance), ("CoinGecko", _fetch_coingecko)]:
-        try:
-            price = fetcher(symbol)
-            if price:
-                _price_cache[symbol] = (price, time.time())
-                return price
-        except Exception as e:
-            logger.warning(f"{name} price fetch failed: {e} -- trying next source.")
-
-    logger.error(f"All price sources failed for {symbol}. Using stale cache.")
-    return cached_price
+import price_service
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
@@ -187,13 +125,24 @@ class StrategyApp(tws.IBKRApp):
     # ── Price fetch ───────────────────────────────────────────────────────────
     def fetch_price(self, contract, crypto: bool = False) -> float | None:
         """
-        Fetch current price.
-        - Crypto: CoinGecko public API (bypasses IBKR API version limit).
-        - Stocks: IBKR historical data (no subscription needed).
+        Fetch current price via the shared PriceService cache.
+        - Crypto : returned instantly from the background-polled cache.
+        - Stocks : served from cache if fresh; otherwise fetched from IBKR
+                   and pushed back into the cache for other instances to reuse.
         """
-        if crypto:
-            return get_crypto_price(contract.symbol)
+        svc    = price_service.get()
+        symbol = contract.symbol.upper()
 
+        if crypto:
+            # Price service polls crypto in the background — just read the cache.
+            # On first startup, wait up to 15s for the initial poll to complete.
+            return svc.wait_for_price(symbol, timeout=15)
+
+        # Stock: return cached price if still fresh
+        if not svc.is_stale(symbol):
+            return svc.get_price(symbol)
+
+        # Cache is stale — fetch from IBKR then push result into shared cache
         with self._price_lock:
             self._req_counter += 1
             req_id = self._req_counter
@@ -214,6 +163,8 @@ class StrategyApp(tws.IBKRApp):
             if not self._price_event.wait(timeout=20):
                 logger.warning("Price fetch timed out.")
                 return None
+            if self.last_price:
+                svc.update(symbol, self.last_price)
             return self.last_price
 
     # ── Open lots via IBKR executions API ────────────────────────────────────
@@ -308,6 +259,9 @@ def run(symbol: str, params: dict = None):
     if app is None:
         logger.error("Could not connect to TWS after 10 attempts.")
         sys.exit(1)
+
+    # Subscribe to price service (auto-adds to .env WATCHLIST if new)
+    price_service.get().subscribe(symbol)
 
     contract = tws.make_contract(symbol)
 
