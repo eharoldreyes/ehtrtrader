@@ -339,18 +339,18 @@ def run(symbol: str, params: dict = None):
                 logger.debug(f"[CHECK] No open lots for {symbol}.")
                 continue
 
+            winning = sum(1 for lot in open_lots
+                         if (price - lot["buy_price"]) / lot["buy_price"] >= sell_target)
+            losing  = sum(1 for lot in open_lots
+                         if (price - lot["buy_price"]) / lot["buy_price"] < 0)
             logger.info(
                 f"[CHECK] {symbol} @ ${price:.2f}  "
-                f"open lots: {len(open_lots)}  "
+                f"lots: {len(open_lots)}  "
+                f"winning: {winning}  losing: {losing}  "
                 f"target: +{sell_target*100:.2f}%"
             )
-            for i, lot in enumerate(open_lots, 1):
+            for lot in open_lots:
                 pct = (price - lot["buy_price"]) / lot["buy_price"]
-                logger.info(
-                    f"  lot {i}: {lot['shares']:.6g} @ ${lot['buy_price']:.2f}  "
-                    f"now {pct*100:+.2f}%  "
-                    f"{'-> SELL' if pct >= sell_target else '-> holding'}"
-                )
                 if pct >= sell_target:
                     with lock:
                         order_id = app.next_order_id
