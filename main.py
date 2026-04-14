@@ -166,6 +166,8 @@ class IBKRApp(EWrapper, EClient):
     def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
         if errorCode in (2104, 2106, 2158):
             logger.debug(f"[Info {errorCode}] {errorString}")
+        elif errorCode == 201:
+            logger.warning(f"[Order {reqId} rejected] {errorString}")
         else:
             logger.error(f"[Error reqId={reqId} code={errorCode}] {errorString}")
 

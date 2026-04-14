@@ -90,6 +90,9 @@ class StrategyApp(tws.IBKRApp):
         self._exec_event   = threading.Event()
         self._exec_results = []   # (contract, execution) from current reqExecutions call
 
+        # Crypto position limit flag (IBKR error 201)
+        self._crypto_limit_hit = False
+
     def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
         if errorCode in (162, 10285):
             logger.warning(f"Price data unavailable for reqId={reqId}: {errorString}")
@@ -99,6 +102,14 @@ class StrategyApp(tws.IBKRApp):
             # The real lots still arrive via execDetails; execDetailsEnd will still fire.
             # Do NOT unblock _exec_event here -- let execDetailsEnd handle it normally.
             logger.debug(f"Skipping unparseable execution record (code 320): {errorString}")
+        elif errorCode == 201 and "crypto" in errorString.lower():
+            # IBKR blocks buys that would push crypto holdings above 30% of account equity.
+            # Set flag so the buy loop pauses until a sell clears some positions.
+            self._crypto_limit_hit = True
+            logger.warning(
+                f"[BUY PAUSED] Crypto position limit reached (IBKR 30% equity cap). "
+                f"Buys are paused until open positions are sold."
+            )
         else:
             super().error(reqId, errorCode, errorString, advancedOrderRejectJson)
 
@@ -270,6 +281,14 @@ def run(symbol: str, params: dict = None):
         nonlocal budget
 
         while not stop_event.is_set():
+            if app._crypto_limit_hit:
+                logger.warning(
+                    "[BUY PAUSED] Waiting for crypto position limit to clear "
+                    "(sell some lots first)."
+                )
+                stop_event.wait(buy_frequency)
+                continue
+
             with lock:
                 current_budget = budget
 
@@ -363,6 +382,9 @@ def run(symbol: str, params: dict = None):
 
                     with lock:
                         budget += sell_value
+
+                    # A sell reduces crypto exposure — allow buys to resume
+                    app._crypto_limit_hit = False
 
                     logger.info(
                         f"[SELL] {lot['shares']:.6g} {symbol} @ ${price:.2f}  "
